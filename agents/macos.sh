@@ -428,7 +428,11 @@ post_json() {
       --data "$body") || HTTP="000"
   fi
   case "$HTTP" in
-    2*) return 0 ;;
+    2*)
+      if grep -q '"ok"[[:space:]]*:[[:space:]]*true' "$RESP_FILE" 2>/dev/null; then return 0; fi
+      echo "[$(now_iso)] POST $url respuesta inesperada http=$HTTP body=$(cat "$RESP_FILE" 2>/dev/null)" >&2
+      return 1
+      ;;
     *) echo "[$(now_iso)] POST $url failed http=$HTTP body=$(cat "$RESP_FILE" 2>/dev/null)" >&2; return 1 ;;
   esac
 }
