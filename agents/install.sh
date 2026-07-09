@@ -1,10 +1,10 @@
 #!/bin/sh
 # Torobyte installer bootstrap - intenta GitHub raw primero (TLS moderno)
-# y usa monitor.torobyte.com como fallback. Compatible con macOS antiguos.
+# y usa la URL estable del proyecto como fallback. Compatible con macOS antiguos.
 set -e
 OS="${1:-linux}"
 ACTION="${2:-install}"
-ORIGIN="https://monitor.torobyte.com"
+ORIGIN="https://project--de5cadf8-756e-4d2f-8f8b-6ca62009361b.lovable.app"
 SOURCES="https://raw.githubusercontent.com/torobyte/servidoresagentes/main/agents $ORIGIN/api/public/agents"
 tmp="$(mktemp)"
 trap 'rm -f "$tmp"' EXIT
