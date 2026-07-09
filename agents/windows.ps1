@@ -44,8 +44,13 @@ function Test-AgentScriptFile($path) {
 function Download-AgentScript($destination) {
   $primary = $Url -replace '/api/public/ingest/metrics.*$', '/api/public/agents/windows.ps1'
   $fallback = 'https://project--de5cadf8-756e-4d2f-8f8b-6ca62009361b-dev.lovable.app/api/public/agents/windows.ps1'
-  $urls = @($primary, $fallback)
+  $rawGithub = 'https://raw.githubusercontent.com/torobyte/servidoresagentes/main/agents/windows.ps1'
+  $urls = @()
+  if ($rawGithub -and $rawGithub -notmatch '__RAW_GITHUB') { $urls += $rawGithub }
+  $urls += $primary
+  $urls += $fallback
   $errs = @()
+
   try {
     [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]'Tls12,Tls11,Tls'
     [Net.ServicePointManager]::ServerCertificateValidationCallback = { $true }
