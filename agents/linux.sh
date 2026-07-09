@@ -34,9 +34,18 @@ if [ "$MODE" = "install-service" ] || [ "$MODE" = "install" ]; then
     INIT=nohup; ok "systemd no disponible — se usará nohup"
   fi
 
-  step 4 $TOTAL "Descargando agente a /usr/local/bin/torobyte-agent.sh ..."
-  AGENT_SCRIPT_URL="${AGENT_SCRIPT_URL:-$(printf '%s' "$INGEST_URL" | sed 's|/api/public/ingest/metrics.*|/api/public/agents/linux.sh|')}"
-  curl -fsSL "$AGENT_SCRIPT_URL" -o /usr/local/bin/torobyte-agent.sh || fail "no se pudo descargar $AGENT_SCRIPT_URL"
+  step 4 $TOTAL "Preparando agente en /usr/local/bin/torobyte-agent.sh ..."
+  if [ -r "$0" ] && head -n 1 "$0" 2>/dev/null | grep -q '^#!/bin/sh'; then
+    cp "$0" /usr/local/bin/torobyte-agent.sh || fail "no se pudo copiar el instalador local"
+    ok "copiado desde instalador local (sin nueva descarga)"
+  else
+    AGENT_SCRIPT_URL="${AGENT_SCRIPT_URL:-$(printf '%s' "$INGEST_URL" | sed 's|/api/public/ingest/metrics.*|/api/public/agents/linux.sh|')}"
+    curl -fsSL --connect-timeout 8 --max-time 40 "$AGENT_SCRIPT_URL" -o /usr/local/bin/torobyte-agent.sh || \
+      curl -fsSL --tlsv1.2 --connect-timeout 8 --max-time 40 "$AGENT_SCRIPT_URL" -o /usr/local/bin/torobyte-agent.sh || \
+      curl -fsSLk --connect-timeout 8 --max-time 40 "$AGENT_SCRIPT_URL" -o /usr/local/bin/torobyte-agent.sh || \
+      fail "no se pudo descargar $AGENT_SCRIPT_URL"
+  fi
+  head -n 1 /usr/local/bin/torobyte-agent.sh | grep -q '^#!/bin/sh' || fail "la descarga no es un script válido"
   chmod +x /usr/local/bin/torobyte-agent.sh
   ok "$(wc -c </usr/local/bin/torobyte-agent.sh) bytes"
 
