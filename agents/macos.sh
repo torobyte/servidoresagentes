@@ -121,8 +121,27 @@ EOF
   if launchctl list 2>/dev/null | grep -q "$LABEL"; then
     ok "agente en ejecución"
   else
-    tail -n 20 "$LOG_PATH" 2>/dev/null >&2 || true
+    tail -n 40 "$LOG_PATH" 2>/dev/null >&2 || true
     fail "el LaunchDaemon no quedó activo"
+  fi
+
+  # Espera activa hasta ver la primera métrica en el log del daemon (max 60s).
+  printf "      esperando primera métrica del daemon..."
+  _seen=0
+  _i=0
+  while [ $_i -lt 30 ]; do
+    if grep -q "metrics ok" "$LOG_PATH" 2>/dev/null; then _seen=1; break; fi
+    printf "."
+    sleep 2
+    _i=$((_i + 1))
+  done
+  printf "\n"
+  if [ "$_seen" = "1" ]; then
+    ok "daemon enviando métricas correctamente"
+  else
+    printf "      \033[1;33m!\033[0m no se detectaron métricas en 60s. Últimas líneas del log:\n" >&2
+    tail -n 40 "$LOG_PATH" 2>/dev/null >&2 || true
+    printf "      \033[1;33m!\033[0m revisa la salida anterior y comparte el log: %s\n" "$LOG_PATH" >&2
   fi
 
   printf "\n\033[1;32m✔ Instalación completada\033[0m\n"
@@ -131,6 +150,7 @@ EOF
   printf "  daemon: %s\n\n" "$LABEL"
   exit 0
 fi
+
 
 if [ "$MODE" = "uninstall" ] || [ "$MODE" = "remove" ]; then
   printf "\n\033[1m🗑  Torobyte Monitor Agent — Desinstalación\033[0m\n\n"
