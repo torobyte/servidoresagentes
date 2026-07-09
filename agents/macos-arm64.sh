@@ -43,7 +43,22 @@ if [ "$MODE" = "install" ]; then
 
   step 4 $TOTAL "Descargando agente (variante arm64)..."
   AGENT_SCRIPT_URL="${AGENT_SCRIPT_URL:-$(printf '%s' "$INGEST_URL" | sed 's|/api/public/ingest/metrics.*|/api/public/agents/macos-arm64.sh|')}"
-  curl -fsSL "$AGENT_SCRIPT_URL" -o "$AGENT_SCRIPT" || fail "no se pudo descargar $AGENT_SCRIPT_URL"
+  RAW_AGENT_URL="https://raw.githubusercontent.com/torobyte/servidoresagentes/main/agents/macos-arm64.sh"
+  dl_agent() {
+    _u="$1"
+    curl -fsSL --connect-timeout 8 --max-time 40 -o "$AGENT_SCRIPT" "$_u" 2>/dev/null && return 0
+    curl -fsSL --tlsv1.2 --connect-timeout 8 --max-time 40 -o "$AGENT_SCRIPT" "$_u" 2>/dev/null && return 0
+    curl -fsSLk --connect-timeout 8 --max-time 40 -o "$AGENT_SCRIPT" "$_u" 2>/dev/null && return 0
+    command -v wget >/dev/null 2>&1 && wget -q --no-check-certificate -O "$AGENT_SCRIPT" "$_u" 2>/dev/null && return 0
+    return 1
+  }
+  _dl_ok=0
+  for _src in "$RAW_AGENT_URL" "$AGENT_SCRIPT_URL"; do
+    case "$_src" in ""|https://raw.githubusercontent.com/torobyte/servidoresagentes/main/agents/macos-arm64.sh) continue ;; esac
+    if dl_agent "$_src"; then _dl_ok=1; ok "descargado desde $_src"; break; fi
+    printf "      \033[1;33m!\033[0m descarga fallida desde %s, probando siguiente...\n" "$_src" >&2
+  done
+  [ "$_dl_ok" = "1" ] || fail "no se pudo descargar el agente (probado: $RAW_AGENT_URL $AGENT_SCRIPT_URL)"
   head -n 1 "$AGENT_SCRIPT" | grep -q '^#!/bin/sh' || fail "la descarga no es un script (¿URL incorrecta?)"
   chmod +x "$AGENT_SCRIPT"
   ok "$(wc -c <"$AGENT_SCRIPT" | tr -d ' ') bytes"
