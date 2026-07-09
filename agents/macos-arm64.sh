@@ -292,7 +292,14 @@ post_json() {
     HTTP=$(curl -sSk --connect-timeout 10 --max-time 20 -o "$RESP_FILE" -w "%{http_code}" -X POST "$url" \
       -H "Content-Type: application/json" -H "Authorization: Bearer $AGENT_TOKEN" --data "$body") || HTTP="000"
   fi
-  case "$HTTP" in 2*) return 0 ;; *) echo "[$(now_iso)] POST $url failed http=$HTTP" >&2; return 1 ;; esac
+  case "$HTTP" in
+    2*)
+      if grep -q '"ok"[[:space:]]*:[[:space:]]*true' "$RESP_FILE" 2>/dev/null; then return 0; fi
+      echo "[$(now_iso)] POST $url respuesta inesperada http=$HTTP body=$(cat "$RESP_FILE" 2>/dev/null)" >&2
+      return 1
+      ;;
+    *) echo "[$(now_iso)] POST $url failed http=$HTTP body=$(cat "$RESP_FILE" 2>/dev/null)" >&2; return 1 ;;
+  esac
 }
 
 DISKS_URL=$(printf '%s' "$INGEST_URL" | sed 's|/metrics$|/disks|')
