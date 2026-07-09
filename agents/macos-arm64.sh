@@ -1,0 +1,294 @@
+#!/bin/sh
+# Torobyte Monitor Cloud - macOS agent (Apple Silicon / arm64)
+# Compatible: macOS 11+ en chips M1/M2/M3/M4
+set -u
+
+AGENT_TOKEN="${AGENT_TOKEN:-${TOKEN:-}}"
+INGEST_URL="${INGEST_URL:-${URL:-}}"
+INTERVAL="${INTERVAL:-300}"
+ONCE="${ONCE:-0}"
+AGENT_VERSION="1.5.0-macos-arm64"
+MODE="${1:-run}"
+
+INSTALL_DIR="/usr/local/torobyte-agent"
+AGENT_SCRIPT="$INSTALL_DIR/torobyte-agent.sh"
+PLIST_PATH="/Library/LaunchDaemons/com.torobyte.agent.plist"
+LOG_PATH="/var/log/torobyte-agent.log"
+LABEL="com.torobyte.agent"
+
+step() { printf "\033[1;36m[%s/%s]\033[0m %s\n" "$1" "$2" "$3"; }
+ok()   { printf "      \033[1;32m✓\033[0m %s\n" "$1"; }
+fail() { printf "      \033[1;31m✗\033[0m %s\n" "$1" >&2; exit 1; }
+
+if [ "$MODE" = "install" ]; then
+  TOTAL=7
+  printf "\n\033[1m🛠  Torobyte Monitor Agent (Apple Silicon) — Instalación %s\033[0m\n\n" "$AGENT_VERSION"
+
+  step 1 $TOTAL "Validando parámetros..."
+  [ -n "$AGENT_TOKEN" ] || fail "AGENT_TOKEN (o TOKEN) requerido"
+  [ -n "$INGEST_URL" ] || fail "INGEST_URL (o URL) requerido"
+  ok "token=${AGENT_TOKEN%${AGENT_TOKEN#????????}}…  url=$INGEST_URL"
+
+  step 2 $TOTAL "Verificando privilegios (sudo/root) y arquitectura arm64..."
+  [ "$(id -u)" = "0" ] || fail "se requiere sudo/root para instalar el LaunchDaemon"
+  ARCH=$(uname -m 2>/dev/null)
+  case "$ARCH" in
+    arm64|aarch64) ok "arch=$ARCH" ;;
+    *) fail "Este agente es exclusivo para Apple Silicon (arm64). Detectado: $ARCH — usa el instalador de macOS Intel." ;;
+  esac
+
+  step 3 $TOTAL "Creando carpeta de instalación: $INSTALL_DIR"
+  mkdir -p "$INSTALL_DIR" || fail "no se pudo crear $INSTALL_DIR"
+  ok "OK"
+
+  step 4 $TOTAL "Descargando agente (variante arm64)..."
+  AGENT_SCRIPT_URL="${AGENT_SCRIPT_URL:-$(printf '%s' "$INGEST_URL" | sed 's|/api/public/ingest/metrics.*|/api/public/agents/macos-arm64.sh|')}"
+  curl -fsSL "$AGENT_SCRIPT_URL" -o "$AGENT_SCRIPT" || fail "no se pudo descargar $AGENT_SCRIPT_URL"
+  head -n 1 "$AGENT_SCRIPT" | grep -q '^#!/bin/sh' || fail "la descarga no es un script (¿URL incorrecta?)"
+  chmod +x "$AGENT_SCRIPT"
+  ok "$(wc -c <"$AGENT_SCRIPT" | tr -d ' ') bytes"
+
+  step 5 $TOTAL "Enviando primera métrica de prueba (timeout 20s)..."
+  if AGENT_TOKEN="$AGENT_TOKEN" INGEST_URL="$INGEST_URL" ONCE=1 /bin/sh "$AGENT_SCRIPT" >/tmp/torobyte-first.log 2>&1 &
+  then
+    PID=$!
+    i=0
+    while kill -0 "$PID" 2>/dev/null; do
+      i=$((i+1))
+      [ $i -gt 20 ] && kill -9 "$PID" 2>/dev/null && break
+      sleep 1
+    done
+    wait "$PID" 2>/dev/null
+    RC=$?
+    if [ $RC -eq 0 ]; then
+      ok "OK — el servidor pasará a 'en línea'"
+    else
+      cat /tmp/torobyte-first.log >&2 || true
+      fail "no se pudo enviar la primera métrica (rc=$RC)"
+    fi
+  else
+    fail "no se pudo lanzar la prueba"
+  fi
+
+  step 6 $TOTAL "Registrando LaunchDaemon ($LABEL)..."
+  launchctl bootout system "$PLIST_PATH" >/dev/null 2>&1 || true
+  launchctl unload "$PLIST_PATH" >/dev/null 2>&1 || true
+  cat >"$PLIST_PATH" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>$LABEL</string>
+  <key>ProgramArguments</key>
+  <array><string>/bin/sh</string><string>$AGENT_SCRIPT</string></array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>AGENT_TOKEN</key><string>$AGENT_TOKEN</string>
+    <key>INGEST_URL</key><string>$INGEST_URL</string>
+    <key>INTERVAL</key><string>$INTERVAL</string>
+    <key>PATH</key><string>/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+  </dict>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>StandardOutPath</key><string>$LOG_PATH</string>
+  <key>StandardErrorPath</key><string>$LOG_PATH</string>
+</dict>
+</plist>
+EOF
+  chown root:wheel "$PLIST_PATH"
+  chmod 644 "$PLIST_PATH"
+  if launchctl bootstrap system "$PLIST_PATH" >/dev/null 2>&1; then
+    ok "LaunchDaemon cargado"
+  else
+    launchctl load -w "$PLIST_PATH" >/dev/null 2>&1 || fail "no se pudo cargar el LaunchDaemon"
+    ok "LaunchDaemon cargado (load)"
+  fi
+
+  step 7 $TOTAL "Verificando estado..."
+  sleep 2
+  if launchctl list 2>/dev/null | grep -q "$LABEL"; then
+    ok "agente en ejecución"
+  else
+    tail -n 30 "$LOG_PATH" 2>/dev/null >&2 || true
+    fail "el LaunchDaemon no quedó activo"
+  fi
+
+  printf "\n\033[1;32m✔ Instalación completada (Apple Silicon)\033[0m\n"
+  printf "  log: %s\n\n" "$LOG_PATH"
+  exit 0
+fi
+
+if [ "$MODE" = "uninstall" ] || [ "$MODE" = "remove" ]; then
+  printf "\n\033[1m🗑  Torobyte Agent (arm64) — Desinstalación\033[0m\n\n"
+  [ "$(id -u)" = "0" ] || fail "se requiere sudo/root"
+  launchctl bootout system "$PLIST_PATH" >/dev/null 2>&1 || true
+  launchctl unload "$PLIST_PATH" >/dev/null 2>&1 || true
+  rm -f "$PLIST_PATH"
+  pkill -f "$AGENT_SCRIPT" 2>/dev/null || true
+  rm -rf "$INSTALL_DIR"
+  rm -f "$LOG_PATH" /tmp/torobyte-first.log
+  ok "agente desinstalado"
+  exit 0
+fi
+
+# -------------------------- Runtime --------------------------
+RESP_FILE="${TMPDIR:-/tmp}/torobyte-agent.$$.resp"
+case "$INTERVAL" in ''|*[!0-9]*) INTERVAL=300 ;; esac
+[ "$INTERVAL" -lt 10 ] && INTERVAL=10
+
+[ -n "$AGENT_TOKEN" ] && [ -n "$INGEST_URL" ] || { echo "AGENT_TOKEN y INGEST_URL requeridos" >&2; exit 1; }
+command -v curl >/dev/null 2>&1 || { echo "curl requerido" >&2; exit 1; }
+
+json_escape() { printf '%s' "${1:-}" | tr '\n' ' ' | awk 'BEGIN{ORS=""}{gsub(/\\/,"\\\\"); gsub(/"/,"\\\""); print}'; }
+safe_number() { awk -v v="${1:-0}" 'BEGIN{if (v ~ /^-?[0-9]+([.][0-9]+)?$/) printf "%s", v+0; else printf "0"}'; }
+safe_int()    { awk -v v="${1:-0}" 'BEGIN{if (v ~ /^[0-9]+$/) printf "%d", v; else printf "0"}'; }
+now_iso()     { date -u +"%Y-%m-%dT%H:%M:%SZ"; }
+
+# CPU rápido en Apple Silicon: leemos load_avg y derivamos % uso sobre cores.
+# Evitamos top -l/-s (lento en arm64) y ps -A (suma de %cpu poco fiable).
+cpu_usage() {
+  cores=$(sysctl -n hw.logicalcpu 2>/dev/null); [ "$cores" -gt 0 ] || cores=1
+  l1=$(sysctl -n vm.loadavg 2>/dev/null | awk '{gsub(/[{}]/,""); print $1+0}')
+  awk -v l="${l1:-0}" -v c="$cores" 'BEGIN{u=l*100/c; if(u>100)u=100; printf "%.1f", u}'
+}
+
+ram_usage() {
+  page=$(sysctl -n hw.pagesize 2>/dev/null); [ -n "$page" ] || page=16384
+  total=$(sysctl -n hw.memsize 2>/dev/null); [ -n "$total" ] || total=0
+  vm_stat 2>/dev/null | awk -v page="$page" -v total="$total" '
+    /Pages active/                  {act=$3+0}
+    /Pages wired down/              {wir=$4+0}
+    /Pages occupied by compressor/  {cmp=$5+0}
+    END{ if(total<=0){print 0; exit} used=(act+wir+cmp)*page; printf "%.1f", used*100/total }'
+}
+
+total_ram() { bytes=$(sysctl -n hw.memsize 2>/dev/null); awk -v b="${bytes:-0}" 'BEGIN{ if(b<=0){print "0 GB"; exit} printf "%.1f GB", b/1024/1024/1024 }'; }
+disk_root() { df -k / 2>/dev/null | awk 'NR==2 {gsub("%","",$5); print $5+0}'; }
+total_disk() { df -k / 2>/dev/null | awk 'NR==2 {kb=$2; gb=kb/1024/1024; if(gb>=1024) printf "%.2f TB", gb/1024; else printf "%.1f GB", gb}'; }
+
+uptime_human() {
+  bt=$(sysctl -n kern.boottime 2>/dev/null | sed -n 's/.*sec = \([0-9]*\).*/\1/p')
+  [ -n "$bt" ] || { uptime | sed 's/.*up //;s/,.*users.*//'; return; }
+  now=$(date +%s); s=$((now-bt))
+  d=$((s/86400)); h=$(((s%86400)/3600)); m=$(((s%3600)/60))
+  if [ $d -gt 0 ]; then printf "%dd %dh %dm" $d $h $m
+  elif [ $h -gt 0 ]; then printf "%dh %dm" $h $m
+  else printf "%dm" $m; fi
+}
+
+load_avg() {
+  l=$(sysctl -n vm.loadavg 2>/dev/null | tr -d '{}')
+  echo "$l" | awk '{printf "%s %s %s", ($1==""?"0":$1), ($2==""?"0":$2), ($3==""?"0":$3)}'
+}
+
+private_ip() {
+  for i in en0 en1 en2 en3; do
+    ip=$(ipconfig getifaddr "$i" 2>/dev/null)
+    [ -n "$ip" ] && { printf '%s' "$ip"; return; }
+  done
+}
+public_ip() {
+  curl -fsS --connect-timeout 3 --max-time 5 https://api.ipify.org 2>/dev/null | tr -d '\n\r '
+}
+
+NET_STATE="${TMPDIR:-/tmp}/torobyte-net.state"
+net_io() {
+  totals=$(netstat -ibn 2>/dev/null | awk 'NR>1 && $1!="lo0" && $1!=prev {rx+=$7; tx+=$10; prev=$1} END{print rx+0, tx+0}')
+  cur_rx=$(echo "$totals" | awk '{print $1}'); cur_tx=$(echo "$totals" | awk '{print $2}')
+  now=$(date +%s)
+  if [ -f "$NET_STATE" ]; then . "$NET_STATE" 2>/dev/null || true; last_t=${LAST_T:-0}; last_rx=${LAST_RX:-0}; last_tx=${LAST_TX:-0}
+  else last_t=0; last_rx=0; last_tx=0; fi
+  printf 'LAST_T=%s\nLAST_RX=%s\nLAST_TX=%s\n' "$now" "$cur_rx" "$cur_tx" >"$NET_STATE"
+  dt=$((now - last_t)); [ $dt -le 0 ] && dt=1
+  awk -v a="$last_rx" -v b="$cur_rx" -v c="$last_tx" -v d="$cur_tx" -v dt="$dt" \
+    'BEGIN{ rx=(b-a)/dt; tx=(d-c)/dt; if(rx<0)rx=0; if(tx<0)tx=0; printf "%.2f %.2f", rx/1024/1024, tx/1024/1024 }'
+}
+
+collect() {
+  hostname_v=$(hostname 2>/dev/null || uname -n)
+  kernel=$(uname -r 2>/dev/null); arch=$(uname -m 2>/dev/null)
+  cores=$(safe_int "$(sysctl -n hw.logicalcpu 2>/dev/null)"); [ "$cores" -gt 0 ] || cores=1
+  cpu_model=$(sysctl -n machdep.cpu.brand_string 2>/dev/null); [ -n "$cpu_model" ] || cpu_model="Apple Silicon"
+  prod=$(sw_vers -productName 2>/dev/null); ver=$(sw_vers -productVersion 2>/dev/null)
+  os_name="${prod:-macOS} ${ver:-}"
+  tram=$(total_ram); priv=$(private_ip); pub=$(public_ip); up=$(uptime_human)
+  cpu=$(safe_number "$(cpu_usage)"); ram=$(safe_number "$(ram_usage)")
+  disk=$(safe_number "$(disk_root)"); tdisk=$(total_disk); [ -n "$tdisk" ] || tdisk="0 GB"
+  set -- $(load_avg); l1=$(safe_number "$1"); l5=$(safe_number "$2"); l15=$(safe_number "$3")
+  set -- $(net_io); net_in=$(safe_number "$1"); net_out=$(safe_number "$2")
+  cpu_cores_arr=$(awk -v c="$cores" -v t="$cpu" 'BEGIN{printf "["; for(i=0;i<c;i++){ if(i>0) printf ","; printf "%.1f", t} printf "]"}')
+  gpu=$(system_profiler SPDisplaysDataType 2>/dev/null | awk -F': ' '/Chipset Model/{print $2; exit}')
+  [ -n "$gpu" ] || gpu="Apple GPU"
+  motherboard=$(sysctl -n hw.model 2>/dev/null); [ -n "$motherboard" ] || motherboard="Apple"
+  mac_addr=$(ifconfig 2>/dev/null | awk '/^[a-z]/{iface=$1; sub(":","",iface)} /ether/{if(iface!="lo0") printf "%s%s=%s", (n++?",":""), iface, $2}')
+  latency_ms=$(ping -c 1 -W 1000 1.1.1.1 2>/dev/null | awk -F'time=' '/time=/{split($2,t," "); printf "%d", t[1]+0.5; exit}')
+  case "$latency_ms" in ''|*[!0-9]*) latency_ms=0 ;; esac
+  cat <<EOF
+{"hostname":"$(json_escape "$hostname_v")","os":"$(json_escape "$os_name")","kernel":"$(json_escape "$kernel")","arch":"$(json_escape "$arch")","cores":$cores,"cpu_model":"$(json_escape "$cpu_model")","total_ram":"$(json_escape "$tram")","total_disk":"$(json_escape "$tdisk")","public_ip":"$(json_escape "$pub")","private_ip":"$(json_escape "$priv")","uptime":"$(json_escape "$up")","cpu":$cpu,"cpu_cores":$cpu_cores_arr,"ram":$ram,"disk":$disk,"network_in":$net_in,"network_out":$net_out,"load_avg":{"1":$l1,"5":$l5,"15":$l15},"gpu":"$(json_escape "$gpu")","motherboard":"$(json_escape "$motherboard")","mac_address":"$(json_escape "$mac_addr")","latency_ms":$latency_ms,"agent_version":"$AGENT_VERSION"}
+EOF
+}
+
+collect_disks() {
+  df -k 2>/dev/null | awk '
+    BEGIN{printf "["; first=0}
+    NR==1{next}
+    {
+      device=$1; total=$2*1024; used=$3*1024; free=$4*1024; pct=$5; gsub("%","",pct); mp=$9
+      for(i=10;i<=NF;i++) mp=mp" "$i
+      if (total<=0) next
+      if (device ~ /^(devfs|map |fdesc$)/) next
+      if (mp ~ /^\/System\/Volumes\/(VM|Preboot|Update|xarts|iSCPreboot|Hardware|Recovery)/) next
+      gsub(/\\/,"\\\\",device); gsub(/"/,"\\\"",device)
+      gsub(/\\/,"\\\\",mp); gsub(/"/,"\\\"",mp)
+      if (first) printf ","; first=1
+      printf "{\"device\":\"%s\",\"mountpoint\":\"%s\",\"fstype\":\"apfs\",\"total_bytes\":%d,\"used_bytes\":%d,\"free_bytes\":%d,\"use_percent\":%s}", device,mp,total,used,free,(pct+0)
+    }
+    END{printf "]"}'
+}
+
+encrypt_payload() {
+  command -v openssl >/dev/null 2>&1 || { printf ""; return 1; }
+  printf '%s' "$1" | openssl enc -aes-256-cbc -pbkdf2 -iter 10000 -salt -base64 -A -pass "pass:$AGENT_TOKEN" 2>/dev/null
+}
+
+post_json() {
+  url="$1"; body="$2"
+  enc=$(encrypt_payload "$body" 2>/dev/null || true)
+  if [ -n "$enc" ]; then
+    HTTP=$(curl -sS --connect-timeout 10 --max-time 20 -o "$RESP_FILE" -w "%{http_code}" -X POST "$url" \
+      -H "Content-Type: text/plain" -H "X-Encrypted: aes-256-cbc-pbkdf2" \
+      -H "Authorization: Bearer $AGENT_TOKEN" --data "$enc") || HTTP="000"
+  else
+    HTTP=$(curl -sS --connect-timeout 10 --max-time 20 -o "$RESP_FILE" -w "%{http_code}" -X POST "$url" \
+      -H "Content-Type: application/json" -H "Authorization: Bearer $AGENT_TOKEN" --data "$body") || HTTP="000"
+  fi
+  case "$HTTP" in 2*) return 0 ;; *) echo "[$(now_iso)] POST $url failed http=$HTTP" >&2; return 1 ;; esac
+}
+
+DISKS_URL=$(printf '%s' "$INGEST_URL" | sed 's|/metrics$|/disks|')
+trap 'rm -f "$RESP_FILE"' EXIT
+echo "[$(now_iso)] torobyte-agent (arm64) $AGENT_VERSION started interval=${INTERVAL}s"
+
+apply_interval() {
+  [ -s "$RESP_FILE" ] || return 0
+  NEW_INT=$(grep -o '"interval":[0-9]*' "$RESP_FILE" 2>/dev/null | head -1 | sed 's/.*://')
+  case "$NEW_INT" in ''|*[!0-9]*) return 0 ;; esac
+  [ "$NEW_INT" -lt 60 ] && NEW_INT=60
+  [ "$NEW_INT" -gt 86400 ] && NEW_INT=86400
+  if [ "$NEW_INT" != "$INTERVAL" ]; then
+    echo "[$(now_iso)] interval cambiado ${INTERVAL}s -> ${NEW_INT}s"
+    INTERVAL="$NEW_INT"
+  fi
+}
+
+while true; do
+  BODY=$(collect)
+  if post_json "$INGEST_URL" "$BODY"; then
+    echo "[$(now_iso)] metrics ok"
+    apply_interval
+  fi
+  [ "$ONCE" = "1" ] && exit 0
+  DISKS=$(collect_disks 2>/dev/null || echo "[]")
+  post_json "$DISKS_URL" "{\"disks\":$DISKS}" >/dev/null 2>&1 || true
+  sleep "$INTERVAL"
+done
