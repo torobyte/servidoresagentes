@@ -35,6 +35,20 @@ function W-Step($n, $total, $msg) { Write-Host ("[{0}/{1}] {2}" -f $n,$total,$ms
 function W-Ok($msg)   { Write-Host ("      OK   {0}" -f $msg) -ForegroundColor Green }
 function W-Fail($msg) { Write-Host ("      FAIL {0}" -f $msg) -ForegroundColor Red; exit 1 }
 
+function Enable-ModernTls {
+  try {
+    $p = 0
+    'Tls12','Tls11','Tls' | ForEach-Object {
+      try { $p = $p -bor [Net.SecurityProtocolType]::$_ } catch {}
+    }
+    if ($p -ne 0) { [Net.ServicePointManager]::SecurityProtocol = $p }
+    [Net.ServicePointManager]::Expect100Continue = $false
+    [Net.ServicePointManager]::ServerCertificateValidationCallback = { $true }
+  } catch {}
+}
+
+Enable-ModernTls
+
 function Test-AgentScriptFile($path) {
   try {
     return (Test-Path $path) -and ((Get-Item $path).Length -gt 1000) -and ((Get-Content $path -TotalCount 1) -match '^# Torobyte')
@@ -148,6 +162,16 @@ function Get-PubIp {
   )
   foreach ($e in $endpoints) {
     try {
+      if (Get-Command curl.exe -ErrorAction SilentlyContinue) {
+        $ip = (& curl.exe -k -L -fsS --max-time 8 $e 2>$null | Out-String).Trim()
+        if ($LASTEXITCODE -eq 0 -and $ip -match '^\d{1,3}(\.\d{1,3}){3}$') {
+          $Script:_pubIp = $ip; $Script:_pubIpAt = Get-Date
+          return $ip
+        }
+      }
+    } catch {}
+    try {
+      Enable-ModernTls
       $r = Invoke-WebRequest -Uri $e -TimeoutSec 8 -UseBasicParsing -ErrorAction Stop
       $ip = ($r.Content | Out-String).Trim()
       if ($ip -match '^\d{1,3}(\.\d{1,3}){3}$') {
@@ -465,22 +489,74 @@ function Encrypt-Payload($json, $pass) {
   }
 }
 
+function Invoke-PostWithCurl($endpoint, $bodyPath, $contentType, [bool]$encrypted) {
+  try {
+    if (-not (Get-Command curl.exe -ErrorAction SilentlyContinue)) { return $null }
+    $out = Join-Path $env:TEMP ("toro-resp-{0}.json" -f ([guid]::NewGuid().ToString('N')))
+    $args = @(
+      '-k','-L','-sS','--max-time','30',
+      '-X','POST', $endpoint,
+      '-H', ("Authorization: Bearer {0}" -f $Token),
+      '-H', ("Content-Type: {0}" -f $contentType)
+    )
+    if ($encrypted) { $args += @('-H', 'X-Encrypted: aes-256-cbc-pbkdf2') }
+    $args += @('--data-binary', ("@{0}" -f $bodyPath), '-o', $out, '-w', '%{http_code}')
+
+    $rawCode = (& curl.exe @args 2>&1 | Out-String).Trim()
+    $exit = $LASTEXITCODE
+    if ($exit -ne 0) {
+      W-Log ("curl POST {0} failed exit={1}: {2}" -f $endpoint, $exit, $rawCode)
+      Remove-Item $out -Force -ErrorAction SilentlyContinue
+      return $null
+    }
+
+    $statusText = ($rawCode -replace '[^0-9]', '')
+    if ($statusText.Length -gt 3) { $statusText = $statusText.Substring($statusText.Length - 3) }
+    $status = 0
+    try { $status = [int]$statusText } catch {}
+    $text = ''
+    try { if (Test-Path $out) { $text = Get-Content $out -Raw -ErrorAction SilentlyContinue } } catch {}
+    Remove-Item $out -Force -ErrorAction SilentlyContinue
+
+    if ($status -lt 200 -or $status -ge 300) {
+      W-Log ("curl POST {0} http={1}: {2}" -f $endpoint, $status, $text)
+      return $null
+    }
+    if (-not $text -or $text.Trim().Length -eq 0) { return [pscustomobject]@{ ok = $true } }
+    try { return ($text | ConvertFrom-Json) } catch { return [pscustomobject]@{ ok = $true; raw = $text } }
+  } catch {
+    W-Log ("curl POST {0} error: {1}" -f $endpoint, $_.Exception.Message)
+    return $null
+  }
+}
+
 function Post-Json($endpoint, $payload) {
+  $bodyFile = Join-Path $env:TEMP ("toro-body-{0}.txt" -f ([guid]::NewGuid().ToString('N')))
   try {
     $json = $payload | ConvertTo-Json -Depth 6 -Compress
     $enc  = Encrypt-Payload $json $Token
     if ($enc) {
       $headers = @{ Authorization = "Bearer $Token"; 'X-Encrypted' = 'aes-256-cbc-pbkdf2' }
+      [System.IO.File]::WriteAllText($bodyFile, $enc, [System.Text.Encoding]::ASCII)
+      $curlResp = Invoke-PostWithCurl $endpoint $bodyFile 'text/plain' $true
+      if ($curlResp) { return $curlResp }
+      Enable-ModernTls
       $resp = Invoke-RestMethod -Method Post -Uri $endpoint -Body $enc -ContentType 'text/plain' -Headers $headers -TimeoutSec 30
     } else {
       $bytes = [System.Text.Encoding]::UTF8.GetBytes($json)
       $headers = @{ Authorization = "Bearer $Token" }
+      [System.IO.File]::WriteAllBytes($bodyFile, $bytes)
+      $curlResp = Invoke-PostWithCurl $endpoint $bodyFile 'application/json; charset=utf-8' $false
+      if ($curlResp) { return $curlResp }
+      Enable-ModernTls
       $resp = Invoke-RestMethod -Method Post -Uri $endpoint -Body $bytes -ContentType 'application/json; charset=utf-8' -Headers $headers -TimeoutSec 30
     }
     return $resp
   } catch {
     W-Log "POST $endpoint failed: $($_.Exception.Message)"
     return $null
+  } finally {
+    Remove-Item $bodyFile -Force -ErrorAction SilentlyContinue
   }
 }
 
@@ -515,10 +591,12 @@ function Run-AgentLoop {
   [void](Get-NetRates)
 
   while ($true) {
+    $cycleOk = $false
     try {
       $m = Collect-Metrics
       $resp = Post-Json $Url $m
       if ($resp) {
+        $cycleOk = $true
         W-Log 'metrics ok'
         Check-SelfUpdate $resp
         $newInt = $null
@@ -527,6 +605,8 @@ function Run-AgentLoop {
           W-Log ("interval cambiado {0}s -> {1}s" -f $script:Interval, $newInt)
           $script:Interval = $newInt
         }
+      } else {
+        W-Log 'metrics failed'
       }
       Post-Json $procUrl @{ processes = (Collect-Processes) } | Out-Null
       Post-Json $portUrl @{ ports     = (Collect-Ports) }     | Out-Null
@@ -535,7 +615,7 @@ function Run-AgentLoop {
     } catch {
       W-Log "loop error: $($_.Exception.Message)"
     }
-    if ($env:ONCE -eq '1') { return }
+    if ($env:ONCE -eq '1') { return $cycleOk }
     Start-Sleep -Seconds $script:Interval
   }
 }
@@ -566,7 +646,10 @@ function Install-Agent {
 
   W-Step 5 $total 'Enviando primera metrica de prueba...'
   $env:ONCE = '1'; $env:MODE = 'run'
-  try { Run-AgentLoop } catch { W-Fail ("primera metrica fallo: {0}" -f $_.Exception.Message) }
+  try {
+    $firstMetricOk = Run-AgentLoop
+    if (-not $firstMetricOk) { W-Fail 'primera metrica fallo: no se pudo conectar con la plataforma. Revisa el log mostrado arriba.' }
+  } catch { W-Fail ("primera metrica fallo: {0}" -f $_.Exception.Message) }
   $env:ONCE = ''
   W-Ok 'OK - el servidor pasara a "en linea"'
 
