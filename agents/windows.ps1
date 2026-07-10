@@ -58,8 +58,9 @@ function Test-AgentScriptFile($path) {
 function Download-AgentScript($destination) {
   $primary = $Url -replace '/api/public/ingest/metrics.*$', '/api/public/agents/windows.ps1'
   $fallback = 'https://project--de5cadf8-756e-4d2f-8f8b-6ca62009361b-dev.lovable.app/api/public/agents/windows.ps1'
+  $supabase = 'https://giwbmxwlklctlcuyaxzy.functions.supabase.co/windows-agent'
   $rawGithub = 'https://raw.githubusercontent.com/torobyte/servidoresagentes/main/agents/windows.ps1'
-  $urls = @()
+  $urls = @($supabase)
   if ($rawGithub -and $rawGithub -notmatch '__RAW_GITHUB') { $urls += $rawGithub }
   $urls += $primary
   $urls += $fallback
