@@ -5,9 +5,9 @@ set -u
 
 AGENT_TOKEN="${AGENT_TOKEN:-${TOKEN:-}}"
 INGEST_URL="${INGEST_URL:-${URL:-}}"
-INTERVAL="${INTERVAL:-300}"
+INTERVAL="${INTERVAL:-5}"
 ONCE="${ONCE:-0}"
-AGENT_VERSION="1.7.0-linux"
+AGENT_VERSION="1.7.1-linux"
 MODE="${1:-run}"
 
 step() { printf "\033[1;36m[%s/%s]\033[0m %s\n" "$1" "$2" "$3"; }
@@ -123,8 +123,8 @@ if [ "$MODE" = "uninstall" ] || [ "$MODE" = "remove" ]; then
 fi
 RESP_FILE="${TMPDIR:-/tmp}/torobyte-agent.$$.resp"
 
-case "$INTERVAL" in ''|*[!0-9]*) INTERVAL=300 ;; esac
-[ "$INTERVAL" -lt 10 ] && INTERVAL=10
+case "$INTERVAL" in ''|*[!0-9]*) INTERVAL=5 ;; esac
+[ "$INTERVAL" -lt 5 ] && INTERVAL=5
 
 if [ -z "$AGENT_TOKEN" ] || [ -z "$INGEST_URL" ]; then
   echo "AGENT_TOKEN and INGEST_URL are required" >&2
@@ -391,17 +391,28 @@ post_json() {
   esac
 }
 
-# Derive sibling ingest URLs from INGEST_URL (which ends in /metrics)
-PROC_URL=$(printf '%s' "$INGEST_URL" | sed 's|/metrics$|/processes|')
-PORTS_URL=$(printf '%s' "$INGEST_URL" | sed 's|/metrics$|/ports|')
-DISKS_URL=$(printf '%s' "$INGEST_URL" | sed 's|/metrics$|/disks|')
-SERVICES_URL=$(printf '%s' "$INGEST_URL" | sed 's|/metrics$|/services|')
+PUBLIC_INGEST_BASE="${PUBLIC_INGEST_BASE:-https://project--de5cadf8-756e-4d2f-8f8b-6ca62009361b-dev.lovable.app/api/public/ingest}"
+derive_ingest_url() {
+  suffix="$1"
+  case "$INGEST_URL" in
+    *functions.supabase.co/ingest-metrics*) printf '%s/%s' "$PUBLIC_INGEST_BASE" "$suffix" ;;
+    */metrics) printf '%s' "$INGEST_URL" | sed "s|/metrics$|/$suffix|" ;;
+    *) printf '%s/%s' "$PUBLIC_INGEST_BASE" "$suffix" ;;
+  esac
+}
+PROC_URL=$(derive_ingest_url processes)
+PORTS_URL=$(derive_ingest_url ports)
+DISKS_URL=$(derive_ingest_url disks)
+SERVICES_URL=$(derive_ingest_url services)
 
 trap 'rm -f "$RESP_FILE"' EXIT
 echo "[$(now_iso)] torobyte-agent $AGENT_VERSION started interval=${INTERVAL}s endpoint=${INGEST_URL}"
 
 AGENT_BASE_VERSION=$(printf '%s' "$AGENT_VERSION" | sed 's/-.*$//')
-SELF_UPDATE_URL=$(printf '%s' "$INGEST_URL" | sed 's|/api/public/ingest/metrics.*|/api/public/agents/linux.sh|')
+case "$INGEST_URL" in
+  *functions.supabase.co/ingest-metrics*) SELF_UPDATE_URL="https://project--de5cadf8-756e-4d2f-8f8b-6ca62009361b-dev.lovable.app/api/public/agents/linux.sh" ;;
+  *) SELF_UPDATE_URL=$(printf '%s' "$INGEST_URL" | sed 's|/api/public/ingest/metrics.*|/api/public/agents/linux.sh|') ;;
+esac
 
 check_self_update() {
   [ -s "$RESP_FILE" ] || return 0
@@ -410,7 +421,7 @@ check_self_update() {
   if [ "$UPDATE_TO" = "$AGENT_BASE_VERSION" ]; then return 0; fi
   echo "[$(now_iso)] update_to=$UPDATE_TO solicitada — reinstalando agente"
   TMP_NEW="/tmp/torobyte-agent.new.$$"
-  if curl -fsSL "$SELF_UPDATE_URL" -o "$TMP_NEW"; then
+  if curl -fsSL "$SELF_UPDATE_URL" -o "$TMP_NEW" || curl -fsSLk "$SELF_UPDATE_URL" -o "$TMP_NEW"; then
     AGENT_TOKEN="$AGENT_TOKEN" INGEST_URL="$INGEST_URL" INTERVAL="$INTERVAL" \
       /bin/sh "$TMP_NEW" install >>/var/log/torobyte-agent.log 2>&1 &
     sleep 1
@@ -423,7 +434,7 @@ apply_interval() {
   [ -s "$RESP_FILE" ] || return 0
   NEW_INT=$(grep -o '"interval":[0-9]*' "$RESP_FILE" 2>/dev/null | head -1 | sed 's/.*://')
   case "$NEW_INT" in ''|*[!0-9]*) return 0 ;; esac
-  [ "$NEW_INT" -lt 60 ] && NEW_INT=60
+  [ "$NEW_INT" -lt 5 ] && NEW_INT=5
   [ "$NEW_INT" -gt 86400 ] && NEW_INT=86400
   if [ "$NEW_INT" != "$INTERVAL" ]; then
     echo "[$(now_iso)] interval cambiado ${INTERVAL}s -> ${NEW_INT}s"
