@@ -5,9 +5,9 @@ set -u
 
 AGENT_TOKEN="${AGENT_TOKEN:-${TOKEN:-}}"
 INGEST_URL="${INGEST_URL:-${URL:-}}"
-INTERVAL="${INTERVAL:-300}"
+INTERVAL="${INTERVAL:-5}"
 ONCE="${ONCE:-0}"
-AGENT_VERSION="1.7.0-macos-arm64"
+AGENT_VERSION="1.7.1-macos-arm64"
 MODE="${1:-run}"
 
 INSTALL_DIR="/usr/local/torobyte-agent"
@@ -153,8 +153,8 @@ fi
 
 # -------------------------- Runtime --------------------------
 RESP_FILE="${TMPDIR:-/tmp}/torobyte-agent.$$.resp"
-case "$INTERVAL" in ''|*[!0-9]*) INTERVAL=300 ;; esac
-[ "$INTERVAL" -lt 10 ] && INTERVAL=10
+case "$INTERVAL" in ''|*[!0-9]*) INTERVAL=5 ;; esac
+[ "$INTERVAL" -lt 5 ] && INTERVAL=5
 
 [ -n "$AGENT_TOKEN" ] && [ -n "$INGEST_URL" ] || { echo "AGENT_TOKEN y INGEST_URL requeridos" >&2; exit 1; }
 command -v curl >/dev/null 2>&1 || { echo "curl requerido" >&2; exit 1; }
@@ -266,6 +266,73 @@ collect_disks() {
     END{printf "]"}'
 }
 
+# -------------------------- Aplicaciones (uso) --------------------------
+APPS_STATE_DIR="${TMPDIR:-/tmp}/torobyte-apps"
+APP_SAMPLE=5
+mkdir -p "$APPS_STATE_DIR" 2>/dev/null || true
+
+console_user() { stat -f %Su /dev/console 2>/dev/null | tr -d '\n'; }
+
+foreground_app() {
+  cu=$(console_user)
+  [ -n "$cu" ] && [ "$cu" != "root" ] || return 0
+  uid=$(id -u "$cu" 2>/dev/null || echo "")
+  if [ -n "$uid" ] && command -v launchctl >/dev/null 2>&1; then
+    launchctl asuser "$uid" sudo -u "$cu" osascript -e 'tell application "System Events" to name of first application process whose frontmost is true' 2>/dev/null && return 0
+  fi
+  sudo -u "$cu" osascript -e 'tell application "System Events" to name of first application process whose frontmost is true' 2>/dev/null || true
+}
+
+open_apps() {
+  cu=$(console_user)
+  uid=$(id -u "$cu" 2>/dev/null || echo "")
+  if [ -n "$uid" ] && command -v launchctl >/dev/null 2>&1; then
+    launchctl asuser "$uid" sudo -u "$cu" osascript -e 'tell application "System Events" to get name of every application process whose background only is false' 2>/dev/null | tr ',' '\n' | sed 's/^ *//;s/ *$//' | awk 'NF && !seen[$0]++ {print}' && return 0
+  fi
+  ps -axo comm= 2>/dev/null | awk -F/ '/\.app\// {for(i=1;i<=NF;i++) if($i ~ /\.app$/){sub(/\.app$/,"",$i); print $i}}' | awk 'NF && !seen[$0]++ {print}'
+}
+
+app_key() { printf '%s' "$1" | tr 'A-Z' 'a-z' | tr -c 'a-z0-9._-' '_'; }
+bump() { f="$1"; delta="$2"; cur=0; [ -f "$f" ] && cur=$(cat "$f" 2>/dev/null | tr -cd 0-9); [ -z "$cur" ] && cur=0; echo $((cur + delta)) > "$f"; }
+touch_seen() { day="$1"; kind="$2"; name="$3"; nowiso="$4"; fs="$APPS_STATE_DIR/$day.first.$kind.$name"; ls_="$APPS_STATE_DIR/$day.last.$kind.$name"; [ -f "$fs" ] || echo "$nowiso" > "$fs"; echo "$nowiso" > "$ls_"; }
+
+sample_apps() {
+  day=$(date -u +%Y-%m-%d); nowiso=$(now_iso)
+  fg=$(foreground_app 2>/dev/null || true)
+  if [ -n "$fg" ]; then safe=$(app_key "$fg"); bump "$APPS_STATE_DIR/$day.active.$safe" "$APP_SAMPLE"; touch_seen "$day" "active" "$safe" "$nowiso"; fi
+  open_apps 2>/dev/null | while IFS= read -r name; do
+    [ -n "$name" ] || continue
+    safe=$(app_key "$name")
+    bump "$APPS_STATE_DIR/$day.open.$safe" "$APP_SAMPLE"
+    touch_seen "$day" "open" "$safe" "$nowiso"
+  done
+}
+
+build_apps_body() {
+  day=$(date -u +%Y-%m-%d)
+  names=$(ls "$APPS_STATE_DIR" 2>/dev/null | awk -F. -v d="$day" '$1==d && ($2=="active" || $2=="open") {print $3}' | sort -u)
+  [ -z "$names" ] && return 1
+  printf '{"date":"%s","apps":[' "$day"
+  first=1
+  for n in $names; do
+    active=0; open=0; fs=""; ls_=""
+    [ -f "$APPS_STATE_DIR/$day.active.$n" ] && active=$(cat "$APPS_STATE_DIR/$day.active.$n" 2>/dev/null | tr -cd 0-9)
+    [ -f "$APPS_STATE_DIR/$day.open.$n" ] && open=$(cat "$APPS_STATE_DIR/$day.open.$n" 2>/dev/null | tr -cd 0-9)
+    for k in active open; do f="$APPS_STATE_DIR/$day.first.$k.$n"; [ -f "$f" ] && { fs=$(cat "$f" 2>/dev/null); break; }; done
+    for k in active open; do l="$APPS_STATE_DIR/$day.last.$k.$n"; [ -f "$l" ] && ls_=$(cat "$l" 2>/dev/null); done
+    [ "$first" = "1" ] || printf ','; first=0
+    printf '{"key":"%s","label":"%s","seconds_active":%s,"seconds_open":%s,"first_seen":"%s","last_seen":"%s"}' "$(json_escape "$n")" "$(json_escape "$n")" "${active:-0}" "${open:-0}" "$(json_escape "$fs")" "$(json_escape "$ls_")"
+  done
+  printf ']}'
+}
+
+send_apps() {
+  BODY=$(build_apps_body) || return 0
+  post_json "$APPS_URL" "$BODY" >/dev/null 2>&1 || return 0
+  day=$(date -u +%Y-%m-%d)
+  rm -f "$APPS_STATE_DIR/$day.active."* "$APPS_STATE_DIR/$day.open."* 2>/dev/null || true
+}
+
 encrypt_payload() {
   command -v openssl >/dev/null 2>&1 || { printf ""; return 1; }
   printf '%s' "$1" | openssl enc -aes-256-cbc -pbkdf2 -iter 10000 -salt -base64 -A -pass "pass:$AGENT_TOKEN" 2>/dev/null
@@ -302,15 +369,46 @@ post_json() {
   esac
 }
 
-DISKS_URL=$(printf '%s' "$INGEST_URL" | sed 's|/metrics$|/disks|')
+PUBLIC_INGEST_BASE="${PUBLIC_INGEST_BASE:-https://project--de5cadf8-756e-4d2f-8f8b-6ca62009361b-dev.lovable.app/api/public/ingest}"
+derive_ingest_url() {
+  suffix="$1"
+  case "$INGEST_URL" in
+    *functions.supabase.co/ingest-metrics*) printf '%s/%s' "$PUBLIC_INGEST_BASE" "$suffix" ;;
+    */metrics) printf '%s' "$INGEST_URL" | sed "s|/metrics$|/$suffix|" ;;
+    *) printf '%s/%s' "$PUBLIC_INGEST_BASE" "$suffix" ;;
+  esac
+}
+DISKS_URL=$(derive_ingest_url disks)
+APPS_URL=$(derive_ingest_url apps)
 trap 'rm -f "$RESP_FILE"' EXIT
 echo "[$(now_iso)] torobyte-agent (arm64) $AGENT_VERSION started interval=${INTERVAL}s"
+
+AGENT_BASE_VERSION=$(printf '%s' "$AGENT_VERSION" | sed 's/-.*$//')
+case "$INGEST_URL" in
+  *functions.supabase.co/ingest-metrics*) SELF_UPDATE_URL="https://project--de5cadf8-756e-4d2f-8f8b-6ca62009361b-dev.lovable.app/api/public/agents/macos-arm64.sh" ;;
+  *) SELF_UPDATE_URL=$(printf '%s' "$INGEST_URL" | sed 's|/api/public/ingest/metrics.*|/api/public/agents/macos-arm64.sh|') ;;
+esac
+
+check_self_update() {
+  [ -s "$RESP_FILE" ] || return 0
+  UPDATE_TO=$(grep -o '"update_to":"[^"]*"' "$RESP_FILE" 2>/dev/null | head -1 | sed 's/.*:"//;s/"$//')
+  [ -n "$UPDATE_TO" ] && [ "$UPDATE_TO" != "null" ] || return 0
+  [ "$UPDATE_TO" = "$AGENT_BASE_VERSION" ] && return 0
+  echo "[$(now_iso)] update_to=$UPDATE_TO solicitada — reinstalando agente"
+  TMP_NEW="/tmp/torobyte-agent.new.$$"
+  if curl -fsSL "$SELF_UPDATE_URL" -o "$TMP_NEW" || curl -fsSLk "$SELF_UPDATE_URL" -o "$TMP_NEW"; then
+    AGENT_TOKEN="$AGENT_TOKEN" INGEST_URL="$INGEST_URL" INTERVAL="$INTERVAL" /bin/sh "$TMP_NEW" install >>"$LOG_PATH" 2>&1 &
+    sleep 1
+    exit 0
+  fi
+  rm -f "$TMP_NEW" 2>/dev/null
+}
 
 apply_interval() {
   [ -s "$RESP_FILE" ] || return 0
   NEW_INT=$(grep -o '"interval":[0-9]*' "$RESP_FILE" 2>/dev/null | head -1 | sed 's/.*://')
   case "$NEW_INT" in ''|*[!0-9]*) return 0 ;; esac
-  [ "$NEW_INT" -lt 60 ] && NEW_INT=60
+  [ "$NEW_INT" -lt 5 ] && NEW_INT=5
   [ "$NEW_INT" -gt 86400 ] && NEW_INT=86400
   if [ "$NEW_INT" != "$INTERVAL" ]; then
     echo "[$(now_iso)] interval cambiado ${INTERVAL}s -> ${NEW_INT}s"
@@ -322,10 +420,13 @@ while true; do
   BODY=$(collect)
   if post_json "$INGEST_URL" "$BODY"; then
     echo "[$(now_iso)] metrics ok"
+    check_self_update
     apply_interval
   fi
   [ "$ONCE" = "1" ] && exit 0
   DISKS=$(collect_disks 2>/dev/null || echo "[]")
   post_json "$DISKS_URL" "{\"disks\":$DISKS}" >/dev/null 2>&1 || true
+  sample_apps 2>/dev/null || true
+  send_apps 2>/dev/null || true
   sleep "$INTERVAL"
 done
