@@ -14,7 +14,7 @@ $p=0;'Ssl3','Tls','Tls11','Tls12','Tls13'|%{try{$p=$p-bor[Net.SecurityProtocolTy
 try { [Net.ServicePointManager]::ServerCertificateValidationCallback = { $true } } catch {}
 $ErrorActionPreference = 'Continue'
 
-$AgentVersion = '1.5.2-windows'
+$AgentVersion = '1.5.3-windows'
 $Token        = if ($env:AGENT_TOKEN) { $env:AGENT_TOKEN } else { $env:TOKEN }
 $Url          = if ($env:INGEST_URL)  { $env:INGEST_URL }  else { $env:URL }
 $Interval     = if ($env:INTERVAL)    { [int]$env:INTERVAL } else { 300 }
@@ -198,26 +198,47 @@ function Get-CpuPercent {
 }
 
 function Get-CpuCores {
+  # Devuelve un arreglo con el % de uso por CPU lógica.
+  # Se prueban múltiples fuentes porque los nombres de contadores están
+  # localizados (ej. español) y algunos sistemas los devuelven como
+  # "socket,core" (0,0 / 0,1 / 0,_Total).
+  $arr = New-Object System.Collections.ArrayList
+
+  # 1) Win32_PerfFormattedData_Counters_ProcessorInformation (Win7+)
+  #    Nombres típicos: "0,0", "0,1", ..., "0,_Total", "_Total"
+  try {
+    $rows = Get-CimInstance Win32_PerfFormattedData_Counters_ProcessorInformation -ErrorAction Stop |
+            Where-Object { $_.Name -and $_.Name -notmatch '_Total\s*$' } |
+            Sort-Object { $_.Name }
+    foreach ($r in $rows) {
+      [void]$arr.Add([math]::Round((To-Double $r.PercentProcessorTime 0), 1))
+    }
+    if ($arr.Count -gt 0) { return ,$arr.ToArray() }
+  } catch {}
+
+  # 2) Win32_PerfFormattedData_PerfOS_Processor (nombres numéricos "0","1",...)
+  try {
+    $rows = Get-CimInstance Win32_PerfFormattedData_PerfOS_Processor -ErrorAction Stop |
+            Where-Object { $_.Name -and $_.Name -ne '_Total' } |
+            Sort-Object { try { [int]$_.Name } catch { $_.Name } }
+    foreach ($r in $rows) {
+      [void]$arr.Add([math]::Round((To-Double $r.PercentProcessorTime 0), 1))
+    }
+    if ($arr.Count -gt 0) { return ,$arr.ToArray() }
+  } catch {}
+
+  # 3) Get-Counter con wildcard (locale-sensible, último recurso)
   try {
     $samples = Get-Counter '\Processor(*)\% Processor Time' -ErrorAction Stop
-    $list = New-Object System.Collections.ArrayList
     foreach ($s in $samples.CounterSamples) {
       $name = "$($s.InstanceName)"
-      if ($name -eq '_total') { continue }
-      if ($name -notmatch '^[0-9]+$') { continue }
-      [void]$list.Add([math]::Round((To-Double $s.CookedValue 0), 1))
+      if ($name -match '_total') { continue }
+      [void]$arr.Add([math]::Round((To-Double $s.CookedValue 0), 1))
     }
-    return ,$list.ToArray()
-  } catch {
-    try {
-      $arr = @()
-      $cs = Get-CimInstance Win32_PerfFormattedData_PerfOS_Processor -ErrorAction Stop |
-            Where-Object { $_.Name -ne '_Total' -and $_.Name -match '^[0-9]+$' } |
-            Sort-Object { [int]$_.Name }
-      foreach ($p in $cs) { $arr += [math]::Round((To-Double $p.PercentProcessorTime 0), 1) }
-      return ,$arr
-    } catch { return ,@() }
-  }
+    if ($arr.Count -gt 0) { return ,$arr.ToArray() }
+  } catch {}
+
+  return ,@()
 }
 
 $Script:_lastNet = $null
