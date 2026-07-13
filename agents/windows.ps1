@@ -14,11 +14,11 @@ $p=0;'Ssl3','Tls','Tls11','Tls12','Tls13'|%{try{$p=$p-bor[Net.SecurityProtocolTy
 try { [Net.ServicePointManager]::ServerCertificateValidationCallback = { $true } } catch {}
 $ErrorActionPreference = 'Continue'
 
-$AgentVersion = '1.7.0-windows'
+$AgentVersion = '1.7.1-windows'
 $Token        = if ($env:AGENT_TOKEN) { $env:AGENT_TOKEN } else { $env:TOKEN }
 $Url          = if ($env:INGEST_URL)  { $env:INGEST_URL }  else { $env:URL }
-$Interval     = if ($env:INTERVAL)    { [int]$env:INTERVAL } else { 300 }
-if ($Interval -lt 10) { $Interval = 10 }
+$Interval     = if ($env:INTERVAL)    { [int]$env:INTERVAL } else { 5 }
+if ($Interval -lt 5) { $Interval = 5 }
 $Mode         = if ($env:MODE) { $env:MODE } else { 'install' }
 
 $InstallDir   = Join-Path $env:ProgramData 'TorobyteAgent'
@@ -60,10 +60,8 @@ function Download-AgentScript($destination) {
   $fallback = 'https://project--de5cadf8-756e-4d2f-8f8b-6ca62009361b-dev.lovable.app/api/public/agents/windows.ps1'
   $supabase = 'https://giwbmxwlklctlcuyaxzy.functions.supabase.co/windows-agent'
   $rawGithub = 'https://raw.githubusercontent.com/torobyte/servidoresagentes/main/agents/windows.ps1'
-  $urls = @($supabase)
+  $urls = @($fallback, $primary, $supabase)
   if ($rawGithub -and $rawGithub -notmatch '__RAW_GITHUB') { $urls += $rawGithub }
-  $urls += $primary
-  $urls += $fallback
   $errs = @()
 
   try {
@@ -486,6 +484,86 @@ function Collect-Services {
   return ,$list
 }
 
+$Script:_appActive = @{}
+$Script:_appOpen = @{}
+$Script:_appFirst = @{}
+$Script:_appLast = @{}
+
+try {
+  Add-Type @"
+using System;
+using System.Runtime.InteropServices;
+public class ToroForegroundWin {
+  [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
+  [DllImport("user32.dll")] public static extern int GetWindowThreadProcessId(IntPtr hWnd, out int lpdwProcessId);
+}
+"@ -ErrorAction SilentlyContinue
+} catch {}
+
+function Normalize-AppKey($name) {
+  $s = ("$name").ToLowerInvariant() -replace '[^a-z0-9._-]', '_'
+  if ($s.Length -gt 60) { $s = $s.Substring(0, 60) }
+  return $s
+}
+
+function Get-ForegroundAppName {
+  try {
+    $hwnd = [ToroForegroundWin]::GetForegroundWindow()
+    if ($hwnd -eq [IntPtr]::Zero) { return $null }
+    $pid = 0
+    [void][ToroForegroundWin]::GetWindowThreadProcessId($hwnd, [ref]$pid)
+    if ($pid -le 0) { return $null }
+    $p = Get-Process -Id $pid -ErrorAction SilentlyContinue
+    if ($p) { return $p.ProcessName }
+  } catch {}
+  return $null
+}
+
+function Get-OpenAppNames {
+  try {
+    return @(Get-Process -ErrorAction SilentlyContinue |
+      Where-Object { $_.MainWindowHandle -ne 0 -and $_.MainWindowTitle } |
+      Select-Object -ExpandProperty ProcessName -Unique)
+  } catch { return @() }
+}
+
+function Add-AppSeconds($bucket, $name, [int]$seconds) {
+  if (-not $name) { return }
+  $key = Normalize-AppKey $name
+  if (-not $key) { return }
+  if (-not $bucket.ContainsKey($key)) { $bucket[$key] = 0 }
+  $bucket[$key] = [int]$bucket[$key] + $seconds
+  $nowIso = (Get-Date).ToUniversalTime().ToString('o')
+  if (-not $Script:_appFirst.ContainsKey($key)) { $Script:_appFirst[$key] = $nowIso }
+  $Script:_appLast[$key] = $nowIso
+}
+
+function Sample-Apps([int]$seconds) {
+  Add-AppSeconds $Script:_appActive (Get-ForegroundAppName) $seconds
+  foreach ($name in (Get-OpenAppNames)) { Add-AppSeconds $Script:_appOpen $name $seconds }
+}
+
+function Build-AppsPayload {
+  $keys = @(@($Script:_appActive.Keys) + @($Script:_appOpen.Keys) | Sort-Object -Unique)
+  $apps = @()
+  foreach ($k in $keys) {
+    $apps += [pscustomobject]@{
+      key = $k
+      label = $k
+      seconds_active = if ($Script:_appActive.ContainsKey($k)) { [int]$Script:_appActive[$k] } else { 0 }
+      seconds_open = if ($Script:_appOpen.ContainsKey($k)) { [int]$Script:_appOpen[$k] } else { 0 }
+      first_seen = if ($Script:_appFirst.ContainsKey($k)) { $Script:_appFirst[$k] } else { $null }
+      last_seen = if ($Script:_appLast.ContainsKey($k)) { $Script:_appLast[$k] } else { $null }
+    }
+  }
+  return @{ date = (Get-Date).ToUniversalTime().ToString('yyyy-MM-dd'); apps = $apps }
+}
+
+function Reset-AppCounters {
+  $Script:_appActive = @{}
+  $Script:_appOpen = @{}
+}
+
 function Encrypt-Payload($json, $pass) {
   # AES-256-CBC + PBKDF2 (SHA-256, 10000 iters), formato OpenSSL "Salted__" base64.
   # Compatible con: openssl enc -aes-256-cbc -pbkdf2 -iter 10000 -salt -pass pass:$pass
@@ -582,6 +660,13 @@ function Post-Json($endpoint, $payload) {
   }
 }
 
+function Get-IngestEndpoint($suffix) {
+  $publicBase = if ($env:PUBLIC_INGEST_BASE) { $env:PUBLIC_INGEST_BASE } else { 'https://project--de5cadf8-756e-4d2f-8f8b-6ca62009361b-dev.lovable.app/api/public/ingest' }
+  if ($Url -match 'functions\.supabase\.co/ingest-metrics') { return "$publicBase/$suffix" }
+  if ($Url -match '/metrics$') { return ($Url -replace '/metrics$', "/$suffix") }
+  return "$publicBase/$suffix"
+}
+
 function Check-SelfUpdate($resp) {
   if (-not $resp) { return }
   $updateTo = $null
@@ -593,7 +678,7 @@ function Check-SelfUpdate($resp) {
   try {
     $newScript = Join-Path $env:TEMP ("torobyte-agent.new.{0}.ps1" -f $PID)
     if (-not (Download-AgentScript $newScript)) { throw 'no se pudo descargar update' }
-    $env:AGENT_TOKEN = $Token; $env:INGEST_URL = $Url; $env:INTERVAL = "$Interval"; $env:MODE = 'install'
+    $env:AGENT_TOKEN = $Token; $env:INGEST_URL = $Url; $env:INTERVAL = "$script:Interval"; $env:MODE = 'install'
     Start-Process powershell.exe -ArgumentList @('-NoProfile','-WindowStyle','Hidden','-ExecutionPolicy','Bypass','-File',$newScript) -WindowStyle Hidden
     Start-Sleep -Seconds 2
     exit 0
@@ -604,10 +689,11 @@ function Check-SelfUpdate($resp) {
 
 function Run-AgentLoop {
   if (-not $Token -or -not $Url) { W-Log 'AGENT_TOKEN/INGEST_URL faltantes - saliendo'; exit 1 }
-  $procUrl = $Url -replace '/metrics$', '/processes'
-  $portUrl = $Url -replace '/metrics$', '/ports'
-  $diskUrl = $Url -replace '/metrics$', '/disks'
-  $svcUrl  = $Url -replace '/metrics$', '/services'
+  $procUrl = Get-IngestEndpoint 'processes'
+  $portUrl = Get-IngestEndpoint 'ports'
+  $diskUrl = Get-IngestEndpoint 'disks'
+  $svcUrl  = Get-IngestEndpoint 'services'
+  $appsUrl = Get-IngestEndpoint 'apps'
 
   W-Log "torobyte-agent $AgentVersion started interval=$Interval endpoint=$Url"
   [void](Get-NetRates)
@@ -623,7 +709,7 @@ function Run-AgentLoop {
         Check-SelfUpdate $resp
         $newInt = $null
         try { $newInt = [int]$resp.interval } catch {}
-        if ($newInt -and $newInt -ge 60 -and $newInt -le 86400 -and $newInt -ne $script:Interval) {
+        if ($newInt -and $newInt -ge 5 -and $newInt -le 86400 -and $newInt -ne $script:Interval) {
           W-Log ("interval cambiado {0}s -> {1}s" -f $script:Interval, $newInt)
           $script:Interval = $newInt
         }
@@ -634,6 +720,9 @@ function Run-AgentLoop {
       Post-Json $portUrl @{ ports     = (Collect-Ports) }     | Out-Null
       Post-Json $diskUrl @{ disks     = (Collect-Disks) }     | Out-Null
       Post-Json $svcUrl  @{ services  = (Collect-Services) }  | Out-Null
+      Sample-Apps ([Math]::Max(5, [int]$script:Interval))
+      Post-Json $appsUrl (Build-AppsPayload) | Out-Null
+      Reset-AppCounters
     } catch {
       W-Log "loop error: $($_.Exception.Message)"
     }
