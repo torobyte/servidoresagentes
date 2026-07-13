@@ -14,7 +14,7 @@ AGENT_TOKEN="${AGENT_TOKEN:-${TOKEN:-}}"
 INGEST_URL="${INGEST_URL:-${URL:-}}"
 INTERVAL="${INTERVAL:-300}"
 ONCE="${ONCE:-0}"
-AGENT_VERSION="1.5.0-macos"
+AGENT_VERSION="1.6.0-macos"
 MODE="${1:-run}"
 
 INSTALL_DIR="/usr/local/torobyte-agent"
@@ -302,7 +302,8 @@ collect() {
   tdisk=$(total_disk); [ -n "$tdisk" ] || tdisk="0 GB"
   set -- $(load_avg); l1=$(safe_number "$1"); l5=$(safe_number "$2"); l15=$(safe_number "$3")
   set -- $(net_io); net_in=$(safe_number "$1"); net_out=$(safe_number "$2")
-  cpu_cores_arr=$(awk -v c="$cores" -v t="$cpu" 'BEGIN{printf "["; for(i=0;i<c;i++){ if(i>0) printf ","; printf "%.1f", t} printf "]"}')
+  # macOS no expone uso por núcleo en shell puro (requeriría powermetrics
+  # con sudo). Omitimos el campo para que la UI muestre el placeholder honesto.
 
   gpu=$(system_profiler SPDisplaysDataType 2>/dev/null | awk -F': ' '/Chipset Model/{print $2; exit}')
   [ -n "$gpu" ] || gpu="GPU desconocida"
@@ -314,7 +315,7 @@ collect() {
   case "$latency_ms" in ''|*[!0-9]*) latency_ms=0 ;; esac
 
   cat <<EOF
-{"hostname":"$(json_escape "$hostname_v")","os":"$(json_escape "$os_name")","kernel":"$(json_escape "$kernel")","arch":"$(json_escape "$arch")","cores":$cores,"cpu_model":"$(json_escape "$cpu_model")","total_ram":"$(json_escape "$tram")","total_disk":"$(json_escape "$tdisk")","public_ip":"$(json_escape "$pub")","private_ip":"$(json_escape "$priv")","uptime":"$(json_escape "$up")","cpu":$cpu,"cpu_cores":$cpu_cores_arr,"ram":$ram,"disk":$disk,"network_in":$net_in,"network_out":$net_out,"load_avg":{"1":$l1,"5":$l5,"15":$l15},"gpu":"$(json_escape "$gpu")","motherboard":"$(json_escape "$motherboard")","mac_address":"$(json_escape "$mac_addr")","latency_ms":$latency_ms,"agent_version":"$AGENT_VERSION"}
+{"hostname":"$(json_escape "$hostname_v")","os":"$(json_escape "$os_name")","kernel":"$(json_escape "$kernel")","arch":"$(json_escape "$arch")","cores":$cores,"cpu_model":"$(json_escape "$cpu_model")","total_ram":"$(json_escape "$tram")","total_disk":"$(json_escape "$tdisk")","public_ip":"$(json_escape "$pub")","private_ip":"$(json_escape "$priv")","uptime":"$(json_escape "$up")","cpu":$cpu,"ram":$ram,"disk":$disk,"network_in":$net_in,"network_out":$net_out,"load_avg":{"1":$l1,"5":$l5,"15":$l15},"gpu":"$(json_escape "$gpu")","motherboard":"$(json_escape "$motherboard")","mac_address":"$(json_escape "$mac_addr")","latency_ms":$latency_ms,"agent_version":"$AGENT_VERSION"}
 EOF
 }
 
@@ -441,6 +442,97 @@ PROC_URL=$(printf '%s' "$INGEST_URL" | sed 's|/metrics$|/processes|')
 PORTS_URL=$(printf '%s' "$INGEST_URL" | sed 's|/metrics$|/ports|')
 DISKS_URL=$(printf '%s' "$INGEST_URL" | sed 's|/metrics$|/disks|')
 SERVICES_URL=$(printf '%s' "$INGEST_URL" | sed 's|/metrics$|/services|')
+APPS_URL=$(printf '%s' "$INGEST_URL" | sed 's|/metrics$|/apps|')
+
+# -------------------------- Aplicaciones (uso) --------------------------
+APPS_STATE_DIR="${TMPDIR:-/tmp}/torobyte-apps"
+APP_SAMPLE=5           # cada bucle acumulamos este bloque de segundos
+APP_SEND_EVERY=6       # 6 * INTERVAL antes de enviar (por defecto ~30 min con 300s)
+APPS_LOOP=0
+mkdir -p "$APPS_STATE_DIR" 2>/dev/null || true
+
+console_user() {
+  stat -f %Su /dev/console 2>/dev/null | tr -d '\n'
+}
+
+foreground_app() {
+  cu=$(console_user)
+  [ -n "$cu" ] && [ "$cu" != "root" ] || return 0
+  # osascript debe correr en la sesión del usuario logueado (no como root sin GUI)
+  sudo -u "$cu" osascript -e 'tell application "System Events" to name of first application process whose frontmost is true' 2>/dev/null
+}
+
+open_apps() {
+  # Aplicaciones GUI abiertas (procesos con nombre .app)
+  ps -axco command= 2>/dev/null | awk 'NF && !seen[$0]++ {print}'
+}
+
+app_key() { printf '%s' "$1" | tr 'A-Z' 'a-z' | tr -c 'a-z0-9._-' '_'; }
+
+bump() {
+  f="$1"; delta="$2"
+  cur=0; [ -f "$f" ] && cur=$(cat "$f" 2>/dev/null | tr -cd 0-9)
+  [ -z "$cur" ] && cur=0
+  echo $((cur + delta)) > "$f"
+}
+touch_seen() {
+  day="$1"; kind="$2"; name="$3"; nowiso="$4"
+  fs="$APPS_STATE_DIR/$day.first.$kind.$name"
+  ls_="$APPS_STATE_DIR/$day.last.$kind.$name"
+  [ -f "$fs" ] || echo "$nowiso" > "$fs"
+  echo "$nowiso" > "$ls_"
+}
+
+sample_apps() {
+  day=$(date -u +%Y-%m-%d)
+  nowiso=$(now_iso)
+  fg=$(foreground_app 2>/dev/null || true)
+  if [ -n "$fg" ]; then
+    safe=$(app_key "$fg")
+    bump "$APPS_STATE_DIR/$day.active.$safe" "$APP_SAMPLE"
+    touch_seen "$day" "active" "$safe" "$nowiso"
+  fi
+  open_apps 2>/dev/null | while IFS= read -r name; do
+    [ -n "$name" ] || continue
+    safe=$(app_key "$name")
+    bump "$APPS_STATE_DIR/$day.open.$safe" "$APP_SAMPLE"
+    touch_seen "$day" "open" "$safe" "$nowiso"
+  done
+}
+
+build_apps_body() {
+  day=$(date -u +%Y-%m-%d)
+  names=$(ls "$APPS_STATE_DIR" 2>/dev/null | awk -F. -v d="$day" '$1==d && ($2=="active" || $2=="open") {print $3}' | sort -u)
+  [ -z "$names" ] && return 1
+  printf '{"date":"%s","apps":[' "$day"
+  first=1
+  for n in $names; do
+    active=0; open=0; fs=""; ls_=""
+    [ -f "$APPS_STATE_DIR/$day.active.$n" ] && active=$(cat "$APPS_STATE_DIR/$day.active.$n" 2>/dev/null | tr -cd 0-9)
+    [ -f "$APPS_STATE_DIR/$day.open.$n" ]   && open=$(cat "$APPS_STATE_DIR/$day.open.$n" 2>/dev/null | tr -cd 0-9)
+    for k in active open; do
+      f="$APPS_STATE_DIR/$day.first.$k.$n"
+      [ -f "$f" ] && { fs=$(cat "$f" 2>/dev/null); break; }
+    done
+    for k in active open; do
+      l="$APPS_STATE_DIR/$day.last.$k.$n"
+      [ -f "$l" ] && ls_=$(cat "$l" 2>/dev/null)
+    done
+    [ "$first" = "1" ] || printf ','
+    first=0
+    printf '{"key":"%s","label":"%s","seconds_active":%s,"seconds_open":%s,"first_seen":"%s","last_seen":"%s"}' \
+      "$(json_escape "$n")" "$(json_escape "$n")" "${active:-0}" "${open:-0}" "$(json_escape "$fs")" "$(json_escape "$ls_")"
+  done
+  printf ']}'
+}
+
+send_apps() {
+  BODY=$(build_apps_body) || return 0
+  post_json "$APPS_URL" "$BODY" >/dev/null 2>&1 || return 0
+  # Reset counters tras envío exitoso (dejamos first/last del día)
+  day=$(date -u +%Y-%m-%d)
+  rm -f "$APPS_STATE_DIR/$day.active."* "$APPS_STATE_DIR/$day.open."* 2>/dev/null || true
+}
 
 trap 'rm -f "$RESP_FILE"' EXIT
 echo "[$(now_iso)] torobyte-agent $AGENT_VERSION started interval=${INTERVAL}s endpoint=${INGEST_URL}"
@@ -497,6 +589,14 @@ while true; do
   post_json "$DISKS_URL" "{\"disks\":$DISKS}" >/dev/null 2>&1 || true
   SERVICES=$(collect_services 2>/dev/null || echo "[]")
   post_json "$SERVICES_URL" "{\"services\":$SERVICES}" >/dev/null 2>&1 || true
+
+  # Uso de aplicaciones (muestreo + envío periódico)
+  sample_apps 2>/dev/null || true
+  APPS_LOOP=$((APPS_LOOP + 1))
+  if [ "$APPS_LOOP" -ge "$APP_SEND_EVERY" ]; then
+    send_apps 2>/dev/null || true
+    APPS_LOOP=0
+  fi
 
   sleep "$INTERVAL"
 done
