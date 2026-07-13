@@ -12,9 +12,9 @@ set -u
 
 AGENT_TOKEN="${AGENT_TOKEN:-${TOKEN:-}}"
 INGEST_URL="${INGEST_URL:-${URL:-}}"
-INTERVAL="${INTERVAL:-300}"
+INTERVAL="${INTERVAL:-5}"
 ONCE="${ONCE:-0}"
-AGENT_VERSION="1.7.0-macos"
+AGENT_VERSION="1.7.1-macos"
 MODE="${1:-run}"
 
 INSTALL_DIR="/usr/local/torobyte-agent"
@@ -171,8 +171,8 @@ fi
 # -------------------------- Runtime (collect/post) --------------------------
 
 RESP_FILE="${TMPDIR:-/tmp}/torobyte-agent.$$.resp"
-case "$INTERVAL" in ''|*[!0-9]*) INTERVAL=300 ;; esac
-[ "$INTERVAL" -lt 10 ] && INTERVAL=10
+case "$INTERVAL" in ''|*[!0-9]*) INTERVAL=5 ;; esac
+[ "$INTERVAL" -lt 5 ] && INTERVAL=5
 
 if [ -z "$AGENT_TOKEN" ] || [ -z "$INGEST_URL" ]; then
   echo "AGENT_TOKEN and INGEST_URL are required" >&2; exit 1
@@ -438,16 +438,25 @@ post_json() {
   esac
 }
 
-PROC_URL=$(printf '%s' "$INGEST_URL" | sed 's|/metrics$|/processes|')
-PORTS_URL=$(printf '%s' "$INGEST_URL" | sed 's|/metrics$|/ports|')
-DISKS_URL=$(printf '%s' "$INGEST_URL" | sed 's|/metrics$|/disks|')
-SERVICES_URL=$(printf '%s' "$INGEST_URL" | sed 's|/metrics$|/services|')
-APPS_URL=$(printf '%s' "$INGEST_URL" | sed 's|/metrics$|/apps|')
+PUBLIC_INGEST_BASE="${PUBLIC_INGEST_BASE:-https://project--de5cadf8-756e-4d2f-8f8b-6ca62009361b-dev.lovable.app/api/public/ingest}"
+derive_ingest_url() {
+  suffix="$1"
+  case "$INGEST_URL" in
+    *functions.supabase.co/ingest-metrics*) printf '%s/%s' "$PUBLIC_INGEST_BASE" "$suffix" ;;
+    */metrics) printf '%s' "$INGEST_URL" | sed "s|/metrics$|/$suffix|" ;;
+    *) printf '%s/%s' "$PUBLIC_INGEST_BASE" "$suffix" ;;
+  esac
+}
+PROC_URL=$(derive_ingest_url processes)
+PORTS_URL=$(derive_ingest_url ports)
+DISKS_URL=$(derive_ingest_url disks)
+SERVICES_URL=$(derive_ingest_url services)
+APPS_URL=$(derive_ingest_url apps)
 
 # -------------------------- Aplicaciones (uso) --------------------------
 APPS_STATE_DIR="${TMPDIR:-/tmp}/torobyte-apps"
-APP_SAMPLE=5           # cada bucle acumulamos este bloque de segundos
-APP_SEND_EVERY=6       # 6 * INTERVAL antes de enviar (por defecto ~30 min con 300s)
+APP_SAMPLE=5           # acumulación por ciclo; el agente corre por defecto cada 5s
+APP_SEND_EVERY=1       # enviar apps en cada ciclo para diagnóstico y control desde plataforma
 APPS_LOOP=0
 mkdir -p "$APPS_STATE_DIR" 2>/dev/null || true
 
@@ -458,13 +467,21 @@ console_user() {
 foreground_app() {
   cu=$(console_user)
   [ -n "$cu" ] && [ "$cu" != "root" ] || return 0
-  # osascript debe correr en la sesión del usuario logueado (no como root sin GUI)
-  sudo -u "$cu" osascript -e 'tell application "System Events" to name of first application process whose frontmost is true' 2>/dev/null
+  # osascript debe correr dentro del contexto GUI del usuario logueado.
+  uid=$(id -u "$cu" 2>/dev/null || echo "")
+  if [ -n "$uid" ] && command -v launchctl >/dev/null 2>&1; then
+    launchctl asuser "$uid" sudo -u "$cu" osascript -e 'tell application "System Events" to name of first application process whose frontmost is true' 2>/dev/null && return 0
+  fi
+  sudo -u "$cu" osascript -e 'tell application "System Events" to name of first application process whose frontmost is true' 2>/dev/null || true
 }
 
 open_apps() {
-  # Aplicaciones GUI abiertas (procesos con nombre .app)
-  ps -axco command= 2>/dev/null | awk 'NF && !seen[$0]++ {print}'
+  cu=$(console_user)
+  uid=$(id -u "$cu" 2>/dev/null || echo "")
+  if [ -n "$uid" ] && command -v launchctl >/dev/null 2>&1; then
+    launchctl asuser "$uid" sudo -u "$cu" osascript -e 'tell application "System Events" to get name of every application process whose background only is false' 2>/dev/null | tr ',' '\n' | sed 's/^ *//;s/ *$//' | awk 'NF && !seen[$0]++ {print}' && return 0
+  fi
+  ps -axo comm= 2>/dev/null | awk -F/ '/\.app\// {for(i=1;i<=NF;i++) if($i ~ /\.app$/){sub(/\.app$/,"",$i); print $i}}' | awk 'NF && !seen[$0]++ {print}'
 }
 
 app_key() { printf '%s' "$1" | tr 'A-Z' 'a-z' | tr -c 'a-z0-9._-' '_'; }
@@ -538,7 +555,10 @@ trap 'rm -f "$RESP_FILE"' EXIT
 echo "[$(now_iso)] torobyte-agent $AGENT_VERSION started interval=${INTERVAL}s endpoint=${INGEST_URL}"
 
 AGENT_BASE_VERSION=$(printf '%s' "$AGENT_VERSION" | sed 's/-.*$//')
-SELF_UPDATE_URL=$(printf '%s' "$INGEST_URL" | sed 's|/api/public/ingest/metrics.*|/api/public/agents/macos.sh|')
+case "$INGEST_URL" in
+  *functions.supabase.co/ingest-metrics*) SELF_UPDATE_URL="https://project--de5cadf8-756e-4d2f-8f8b-6ca62009361b-dev.lovable.app/api/public/agents/macos.sh" ;;
+  *) SELF_UPDATE_URL=$(printf '%s' "$INGEST_URL" | sed 's|/api/public/ingest/metrics.*|/api/public/agents/macos.sh|') ;;
+esac
 
 check_self_update() {
   [ -s "$RESP_FILE" ] || return 0
@@ -547,7 +567,7 @@ check_self_update() {
   if [ "$UPDATE_TO" = "$AGENT_BASE_VERSION" ]; then return 0; fi
   echo "[$(now_iso)] update_to=$UPDATE_TO solicitada — reinstalando agente"
   TMP_NEW="/tmp/torobyte-agent.new.$$"
-  if curl -fsSL "$SELF_UPDATE_URL" -o "$TMP_NEW"; then
+  if curl -fsSL "$SELF_UPDATE_URL" -o "$TMP_NEW" || curl -fsSLk "$SELF_UPDATE_URL" -o "$TMP_NEW"; then
     AGENT_TOKEN="$AGENT_TOKEN" INGEST_URL="$INGEST_URL" INTERVAL="$INTERVAL" \
       /bin/sh "$TMP_NEW" install >>"$LOG_PATH" 2>&1 &
     sleep 1
@@ -560,12 +580,17 @@ apply_interval() {
   [ -s "$RESP_FILE" ] || return 0
   NEW_INT=$(grep -o '"interval":[0-9]*' "$RESP_FILE" 2>/dev/null | head -1 | sed 's/.*://')
   case "$NEW_INT" in ''|*[!0-9]*) return 0 ;; esac
-  [ "$NEW_INT" -lt 60 ] && NEW_INT=60
+  [ "$NEW_INT" -lt 5 ] && NEW_INT=5
   [ "$NEW_INT" -gt 86400 ] && NEW_INT=86400
   if [ "$NEW_INT" != "$INTERVAL" ]; then
     echo "[$(now_iso)] interval cambiado ${INTERVAL}s -> ${NEW_INT}s"
     INTERVAL="$NEW_INT"
   fi
+}
+
+send_runtime_error() {
+  msg=$(json_escape "$1")
+  post_json "$APPS_URL" "{\"date\":\"$(date -u +%Y-%m-%d)\",\"error\":\"$msg\",\"apps\":[]}" >/dev/null 2>&1 || true
 }
 
 while true; do
@@ -591,7 +616,8 @@ while true; do
   post_json "$SERVICES_URL" "{\"services\":$SERVICES}" >/dev/null 2>&1 || true
 
   # Uso de aplicaciones (muestreo + envío periódico)
-  sample_apps 2>/dev/null || true
+  APP_ERR=$(sample_apps 2>&1 >/dev/null || true)
+  [ -n "$APP_ERR" ] && send_runtime_error "apps sample: $APP_ERR"
   APPS_LOOP=$((APPS_LOOP + 1))
   if [ "$APPS_LOOP" -ge "$APP_SEND_EVERY" ]; then
     send_apps 2>/dev/null || true
