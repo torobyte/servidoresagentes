@@ -14,7 +14,7 @@ $p=0;'Ssl3','Tls','Tls11','Tls12','Tls13'|%{try{$p=$p-bor[Net.SecurityProtocolTy
 try { [Net.ServicePointManager]::ServerCertificateValidationCallback = { $true } } catch {}
 $ErrorActionPreference = 'Continue'
 
-$AgentVersion = '2.0.0-windows'
+$AgentVersion = '2.0.1-windows'
 $Token        = if ($env:AGENT_TOKEN) { $env:AGENT_TOKEN } else { $env:TOKEN }
 $Url          = if ($env:INGEST_URL)  { $env:INGEST_URL }  else { $env:URL }
 $Interval     = if ($env:INTERVAL)    { [int]$env:INTERVAL } else { 5 }
@@ -491,13 +491,27 @@ $Script:_appLast = @{}
 $Script:_appLabels = @{}
 $Script:_appLastSampleAt = $null
 
+# ---------------------- Sesiones de foreground (v2.0.0) --------------------
+$Script:_curSession   = $null   # sesion foreground en curso
+$Script:_sessionQueue = New-Object System.Collections.ArrayList
+$Script:_curIdle      = $null
+$Script:_idleQueue    = New-Object System.Collections.ArrayList
+$Script:_idleThresholdSec = if ($env:IDLE_THRESHOLD_SECONDS) { [int]$env:IDLE_THRESHOLD_SECONDS } else { 180 }
+$Script:_sessionSampleSec = if ($env:SESSION_SAMPLE_SECONDS) { [int]$env:SESSION_SAMPLE_SECONDS } else { 2 }
+if ($Script:_sessionSampleSec -lt 1) { $Script:_sessionSampleSec = 1 }
+
 try {
   Add-Type @"
 using System;
 using System.Runtime.InteropServices;
+using System.Text;
 public class ToroForegroundWin {
   [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
   [DllImport("user32.dll")] public static extern int GetWindowThreadProcessId(IntPtr hWnd, out int lpdwProcessId);
+  [DllImport("user32.dll", CharSet=CharSet.Auto)] public static extern int GetWindowText(IntPtr hWnd, StringBuilder text, int count);
+  [StructLayout(LayoutKind.Sequential)] public struct LASTINPUTINFO { public uint cbSize; public uint dwTime; }
+  [DllImport("user32.dll")] public static extern bool GetLastInputInfo(ref LASTINPUTINFO plii);
+  [DllImport("kernel32.dll")] public static extern uint GetTickCount();
 }
 "@ -ErrorAction SilentlyContinue
 } catch {}
@@ -592,6 +606,165 @@ function Build-AppsPayload {
 function Reset-AppCounters {
   $Script:_appActive = @{}
   $Script:_appOpen = @{}
+}
+
+# ------------- Foreground sessions v2 (idempotentes por UUID) --------------
+function New-SessionUuid { return [guid]::NewGuid().ToString().ToLowerInvariant() }
+function Iso-Now { return (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ss.fffZ") }
+
+function Get-IdleSeconds {
+  try {
+    $l = New-Object ToroForegroundWin+LASTINPUTINFO
+    $l.cbSize = [uint32][System.Runtime.InteropServices.Marshal]::SizeOf($l)
+    if ([ToroForegroundWin]::GetLastInputInfo([ref]$l)) {
+      $tick = [ToroForegroundWin]::GetTickCount()
+      $diff = $tick - $l.dwTime
+      return [int]([Math]::Max(0, [double]$diff / 1000.0))
+    }
+  } catch {}
+  return 0
+}
+
+function Get-ForegroundSessionInfo {
+  try {
+    $hwnd = [ToroForegroundWin]::GetForegroundWindow()
+    if ($hwnd -eq [IntPtr]::Zero) { return $null }
+    $pid = 0
+    [void][ToroForegroundWin]::GetWindowThreadProcessId($hwnd, [ref]$pid)
+    if ($pid -le 0) { return $null }
+    $p = Get-Process -Id $pid -ErrorAction SilentlyContinue
+    if (-not (Test-UserFacingProcess $p)) { return $null }
+    $sb = New-Object System.Text.StringBuilder 512
+    [void][ToroForegroundWin]::GetWindowText($hwnd, $sb, 512)
+    return @{
+      app_name = (Get-AppDisplayName $p)
+      process_name = try { $p.ProcessName } catch { $null }
+      pid = $pid
+      window_title = $sb.ToString()
+      os_user = try { [Environment]::UserName } catch { $null }
+    }
+  } catch {}
+  return $null
+}
+
+function Close-Session([hashtable]$s, [string]$endIso, [bool]$idleInterrupt=$false) {
+  if (-not $s) { return }
+  $startMs = ([datetime]::Parse($s.started_at)).ToUniversalTime().Ticks
+  $endMs   = ([datetime]::Parse($endIso)).ToUniversalTime().Ticks
+  $durSec  = [int](($endMs - $startMs) / 10000000)
+  if ($durSec -le 0) { return }
+  [void]$Script:_sessionQueue.Add(@{
+    session_uuid = $s.session_uuid
+    application_name = $s.application_name
+    process_name = $s.process_name
+    bundle_id = $null
+    window_title = $s.window_title
+    started_at = $s.started_at
+    ended_at = $endIso
+    duration_seconds = $durSec
+    foreground = $true
+    window_visible = $true
+    idle_interrupted = $idleInterrupt
+    os_user = $s.os_user
+  })
+}
+
+function Sample-Session {
+  $nowIso = Iso-Now
+  $idle = Get-IdleSeconds
+  $sendTitle = $env:TRACK_WINDOW_TITLE -eq '1'
+
+  if ($idle -ge $Script:_idleThresholdSec) {
+    if ($Script:_curSession) { Close-Session $Script:_curSession $nowIso $true; $Script:_curSession = $null }
+    if (-not $Script:_curIdle) {
+      $Script:_curIdle = @{ session_uuid = (New-SessionUuid); started_at = $nowIso; reason = 'idle'; os_user = try { [Environment]::UserName } catch { $null } }
+    }
+    return
+  }
+
+  if ($Script:_curIdle) {
+    $startMs = ([datetime]::Parse($Script:_curIdle.started_at)).ToUniversalTime().Ticks
+    $endMs   = ([datetime]::Parse($nowIso)).ToUniversalTime().Ticks
+    $dur = [int](($endMs - $startMs) / 10000000)
+    [void]$Script:_idleQueue.Add(@{
+      session_uuid = $Script:_curIdle.session_uuid
+      started_at = $Script:_curIdle.started_at
+      ended_at = $nowIso
+      duration_seconds = [Math]::Max(0, $dur)
+      reason = $Script:_curIdle.reason
+      os_user = $Script:_curIdle.os_user
+    })
+    $Script:_curIdle = $null
+  }
+
+  $fg = Get-ForegroundSessionInfo
+  if (-not $fg -or -not $fg.app_name) { return }
+
+  if ($Script:_curSession -and
+      $Script:_curSession.application_name -eq $fg.app_name -and
+      $Script:_curSession.process_name -eq $fg.process_name) {
+    $Script:_curSession.last_seen = $nowIso
+    if ($sendTitle) { $Script:_curSession.window_title = $fg.window_title }
+    return
+  }
+  if ($Script:_curSession) {
+    Close-Session $Script:_curSession $nowIso $false
+  }
+  $Script:_curSession = @{
+    session_uuid = (New-SessionUuid)
+    application_name = $fg.app_name
+    process_name = $fg.process_name
+    window_title = if ($sendTitle) { $fg.window_title } else { $null }
+    started_at = $nowIso
+    last_seen = $nowIso
+    os_user = $fg.os_user
+  }
+}
+
+function Build-SessionsPayload {
+  $sessions = @()
+  foreach ($s in $Script:_sessionQueue) { $sessions += $s }
+  # snapshot de la sesión en curso (upsert por UUID)
+  if ($Script:_curSession) {
+    $s = $Script:_curSession
+    $startMs = ([datetime]::Parse($s.started_at)).ToUniversalTime().Ticks
+    $endMs   = ([datetime]::Parse($s.last_seen)).ToUniversalTime().Ticks
+    $dur = [int](($endMs - $startMs) / 10000000)
+    if ($dur -gt 0) {
+      $sessions += @{
+        session_uuid = $s.session_uuid
+        application_name = $s.application_name
+        process_name = $s.process_name
+        bundle_id = $null
+        window_title = $s.window_title
+        started_at = $s.started_at
+        ended_at = $s.last_seen
+        duration_seconds = $dur
+        foreground = $true
+        window_visible = $true
+        idle_interrupted = $false
+        os_user = $s.os_user
+      }
+    }
+  }
+  $idles = @()
+  foreach ($i in $Script:_idleQueue) { $idles += $i }
+  if ($Script:_curIdle) {
+    $idles += @{
+      session_uuid = $Script:_curIdle.session_uuid
+      started_at = $Script:_curIdle.started_at
+      ended_at = $null
+      duration_seconds = $null
+      reason = $Script:_curIdle.reason
+      os_user = $Script:_curIdle.os_user
+    }
+  }
+  return @{ agent_version = $AgentVersion; sessions = $sessions; idle_sessions = $idles }
+}
+
+function Reset-SessionQueues {
+  $Script:_sessionQueue = New-Object System.Collections.ArrayList
+  $Script:_idleQueue = New-Object System.Collections.ArrayList
 }
 
 function Encrypt-Payload($json, $pass) {
@@ -724,6 +897,7 @@ function Run-AgentLoop {
   $diskUrl = Get-IngestEndpoint 'disks'
   $svcUrl  = Get-IngestEndpoint 'services'
   $appsUrl = Get-IngestEndpoint 'apps'
+  $sessionsUrl = Get-IngestEndpoint 'sessions'
 
   W-Log "torobyte-agent $AgentVersion started interval=$Interval endpoint=$Url"
   [void](Get-NetRates)
@@ -762,11 +936,27 @@ function Run-AgentLoop {
       Sample-Apps $sampleDelta
       Post-Json $appsUrl (Build-AppsPayload) | Out-Null
       Reset-AppCounters
+
+      # Sesiones foreground v2: muestreo fino durante el sleep
+      $slept = 0
+      $step = $Script:_sessionSampleSec
+      while ($slept -lt $script:Interval) {
+        try { Sample-Session } catch { W-Log "session sample error: $($_.Exception.Message)" }
+        if ($env:ONCE -eq '1') { break }
+        Start-Sleep -Seconds $step
+        $slept += $step
+      }
+      try {
+        $sPayload = Build-SessionsPayload
+        if ($sPayload.sessions.Count -gt 0 -or $sPayload.idle_sessions.Count -gt 0) {
+          Post-Json $sessionsUrl $sPayload | Out-Null
+          Reset-SessionQueues
+        }
+      } catch { W-Log "sessions post error: $($_.Exception.Message)" }
     } catch {
       W-Log "loop error: $($_.Exception.Message)"
     }
     if ($env:ONCE -eq '1') { return $cycleOk }
-    Start-Sleep -Seconds $script:Interval
   }
 }
 
