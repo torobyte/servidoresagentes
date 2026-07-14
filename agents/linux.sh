@@ -7,7 +7,7 @@ AGENT_TOKEN="${AGENT_TOKEN:-${TOKEN:-}}"
 INGEST_URL="${INGEST_URL:-${URL:-}}"
 INTERVAL="${INTERVAL:-5}"
 ONCE="${ONCE:-0}"
-AGENT_VERSION="1.7.1-linux"
+AGENT_VERSION="1.7.2-linux"
 MODE="${1:-run}"
 
 step() { printf "\033[1;36m[%s/%s]\033[0m %s\n" "$1" "$2" "$3"; }
@@ -273,7 +273,7 @@ EOF
 }
 
 collect_processes() {
-  ps -eo pid=,user=,pcpu=,pmem=,rss=,comm=,args= --sort=-pcpu 2>/dev/null | head -n 25 | awk '
+  ps -eo pid=,user=,pcpu=,pmem=,rss=,comm=,args= --sort=-pcpu 2>/dev/null | head -n 200 | awk '
     BEGIN{printf "["; first=1}
     {
       pid=$1; user=$2; cpu=$3; mem=$4; rss=$5; name=$6;
