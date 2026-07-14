@@ -7,7 +7,7 @@ AGENT_TOKEN="${AGENT_TOKEN:-${TOKEN:-}}"
 INGEST_URL="${INGEST_URL:-${URL:-}}"
 INTERVAL="${INTERVAL:-5}"
 ONCE="${ONCE:-0}"
-AGENT_VERSION="2.0.1-macos-arm64"
+AGENT_VERSION="2.0.2-macos-arm64"
 MODE="${1:-run}"
 
 INSTALL_DIR="/usr/local/torobyte-agent"
@@ -407,11 +407,11 @@ DISKS_URL=$(derive_ingest_url disks)
 APPS_URL=$(derive_ingest_url apps)
 SESSIONS_URL=$(derive_ingest_url sessions)
 
-# -------- Sesiones foreground v2.0.0 (arm64, versión simplificada) --------
+# -------- Sesiones foreground v2.0.0 (arm64) --------
 SESS_DIR="${TMPDIR:-/tmp}/torobyte-sessions"
 mkdir -p "$SESS_DIR" 2>/dev/null || true
-CUR_S="$SESS_DIR/current.env"
-CUR_I="$SESS_DIR/current-idle.env"
+CUR_S="$SESS_DIR/current"
+CUR_I="$SESS_DIR/current-idle"
 IDLE_THRESHOLD_SEC="${IDLE_THRESHOLD_SECONDS:-180}"
 SESSION_SAMPLE_SEC="${SESSION_SAMPLE_SECONDS:-3}"
 [ "$SESSION_SAMPLE_SEC" -lt 1 ] 2>/dev/null && SESSION_SAMPLE_SEC=1
@@ -420,77 +420,92 @@ new_uuid_arm() {
   if command -v uuidgen >/dev/null 2>&1; then uuidgen | tr 'A-Z' 'a-z'; else python3 -c 'import uuid;print(uuid.uuid4())' 2>/dev/null; fi
 }
 idle_seconds_arm() { ioreg -c IOHIDSystem 2>/dev/null | awk '/HIDIdleTime/ {print int($NF/1000000000); exit}' | tr -cd 0-9; }
+iso_to_epoch_arm() { date -u -j -f "%Y-%m-%dT%H:%M:%SZ" "$1" +%s 2>/dev/null || echo 0; }
+rf() { [ -f "$1/$2" ] && cat "$1/$2" || printf ''; }
+write_cur_s() {
+  rm -rf "$CUR_S" 2>/dev/null; mkdir -p "$CUR_S" 2>/dev/null || return 1
+  printf '%s' "$1" > "$CUR_S/uuid"; printf '%s' "$2" > "$CUR_S/app"
+  printf '%s' "$3" > "$CUR_S/started"; printf '%s' "$4" > "$CUR_S/user"
+}
+write_cur_i() {
+  rm -rf "$CUR_I" 2>/dev/null; mkdir -p "$CUR_I" 2>/dev/null || return 1
+  printf '%s' "$1" > "$CUR_I/uuid"; printf '%s' "$2" > "$CUR_I/started"; printf '%s' "$3" > "$CUR_I/user"
+}
 
 sample_session_arm() {
   now_iso=$(now_iso)
   idle=$(idle_seconds_arm); [ -z "$idle" ] && idle=0
   if [ "$idle" -ge "$IDLE_THRESHOLD_SEC" ]; then
-    if [ -f "$CUR_S" ]; then
-      . "$CUR_S"
-      st=$(date -u -j -f "%Y-%m-%dT%H:%M:%SZ" "$SS_STARTED" +%s 2>/dev/null || echo 0)
-      et=$(date -u +%s); dur=$((et-st))
-      if [ "$dur" -gt 0 ]; then
-        obj=$(printf '{"session_uuid":"%s","application_name":"%s","process_name":"%s","started_at":"%s","ended_at":"%s","duration_seconds":%s,"foreground":true,"window_visible":true,"idle_interrupted":true,"os_user":"%s"}' \
-          "$SS_UUID" "$(json_escape "$SS_APP")" "$(json_escape "$SS_APP")" "$SS_STARTED" "$now_iso" "$dur" "$(json_escape "$SS_USER")")
-        echo "$obj" >> "$SESS_DIR/pending.jsonl"
+    if [ -d "$CUR_S" ]; then
+      su=$(rf "$CUR_S" uuid); sa=$(rf "$CUR_S" app); ss=$(rf "$CUR_S" started); sus=$(rf "$CUR_S" user)
+      st=$(iso_to_epoch_arm "$ss"); et=$(date -u +%s); dur=$((et-st))
+      if [ -n "$su" ] && [ "$dur" -gt 0 ]; then
+        printf '{"session_uuid":"%s","application_name":"%s","process_name":"%s","started_at":"%s","ended_at":"%s","duration_seconds":%s,"foreground":true,"window_visible":true,"idle_interrupted":true,"os_user":"%s"}\n' \
+          "$su" "$(json_escape "$sa")" "$(json_escape "$sa")" "$ss" "$now_iso" "$dur" "$(json_escape "$sus")" >> "$SESS_DIR/pending.jsonl"
       fi
-      rm -f "$CUR_S"
+      rm -rf "$CUR_S"
     fi
-    [ -f "$CUR_I" ] || printf 'II_UUID=%s\nII_STARTED=%s\nII_USER=%s\n' "$(new_uuid_arm)" "$now_iso" "$(console_user)" > "$CUR_I"
+    [ -d "$CUR_I" ] || write_cur_i "$(new_uuid_arm)" "$now_iso" "$(console_user)"
     return 0
   fi
-  if [ -f "$CUR_I" ]; then
-    . "$CUR_I"
-    ist=$(date -u -j -f "%Y-%m-%dT%H:%M:%SZ" "$II_STARTED" +%s 2>/dev/null || echo 0)
-    iet=$(date -u +%s); idur=$((iet-ist))
-    obj=$(printf '{"session_uuid":"%s","started_at":"%s","ended_at":"%s","duration_seconds":%s,"reason":"idle","os_user":"%s"}' \
-      "$II_UUID" "$II_STARTED" "$now_iso" "$idur" "$(json_escape "$II_USER")")
-    echo "$obj" >> "$SESS_DIR/pending-idle.jsonl"
-    rm -f "$CUR_I"
+  if [ -d "$CUR_I" ]; then
+    iu=$(rf "$CUR_I" uuid); is=$(rf "$CUR_I" started); iuser=$(rf "$CUR_I" user)
+    if [ -n "$iu" ]; then
+      ist=$(iso_to_epoch_arm "$is"); iet=$(date -u +%s); idur=$((iet-ist)); [ "$idur" -lt 0 ] && idur=0
+      printf '{"session_uuid":"%s","started_at":"%s","ended_at":"%s","duration_seconds":%s,"reason":"idle","os_user":"%s"}\n' \
+        "$iu" "$is" "$now_iso" "$idur" "$(json_escape "$iuser")" >> "$SESS_DIR/pending-idle.jsonl"
+    fi
+    rm -rf "$CUR_I"
   fi
   fg=$(foreground_app 2>/dev/null || true); [ -z "$fg" ] && return 0
-  if [ -f "$CUR_S" ]; then
-    . "$CUR_S"
-    [ "$SS_APP" = "$fg" ] && return 0
-    st=$(date -u -j -f "%Y-%m-%dT%H:%M:%SZ" "$SS_STARTED" +%s 2>/dev/null || echo 0)
-    et=$(date -u +%s); dur=$((et-st))
-    if [ "$dur" -gt 0 ]; then
-      obj=$(printf '{"session_uuid":"%s","application_name":"%s","process_name":"%s","started_at":"%s","ended_at":"%s","duration_seconds":%s,"foreground":true,"window_visible":true,"idle_interrupted":false,"os_user":"%s"}' \
-        "$SS_UUID" "$(json_escape "$SS_APP")" "$(json_escape "$SS_APP")" "$SS_STARTED" "$now_iso" "$dur" "$(json_escape "$SS_USER")")
-      echo "$obj" >> "$SESS_DIR/pending.jsonl"
+  if [ -d "$CUR_S" ]; then
+    ca=$(rf "$CUR_S" app)
+    [ "$ca" = "$fg" ] && return 0
+    su=$(rf "$CUR_S" uuid); sa=$(rf "$CUR_S" app); ss=$(rf "$CUR_S" started); sus=$(rf "$CUR_S" user)
+    st=$(iso_to_epoch_arm "$ss"); et=$(date -u +%s); dur=$((et-st))
+    if [ -n "$su" ] && [ "$dur" -gt 0 ]; then
+      printf '{"session_uuid":"%s","application_name":"%s","process_name":"%s","started_at":"%s","ended_at":"%s","duration_seconds":%s,"foreground":true,"window_visible":true,"idle_interrupted":false,"os_user":"%s"}\n' \
+        "$su" "$(json_escape "$sa")" "$(json_escape "$sa")" "$ss" "$now_iso" "$dur" "$(json_escape "$sus")" >> "$SESS_DIR/pending.jsonl"
     fi
   fi
-  printf 'SS_UUID=%s\nSS_APP=%s\nSS_STARTED=%s\nSS_USER=%s\n' "$(new_uuid_arm)" "$fg" "$now_iso" "$(console_user)" > "$CUR_S"
+  write_cur_s "$(new_uuid_arm)" "$fg" "$now_iso" "$(console_user)"
+}
+
+jsonl_arr() {
+  f="$1"
+  [ ! -s "$f" ] && { printf '[]'; return 0; }
+  awk 'BEGIN{printf("[")} NF{ if (n++) printf(","); printf("%s", $0) } END{printf("]")}' "$f"
 }
 
 send_sessions_arm() {
-  sessions="[]"; idles="[]"
-  if [ -s "$SESS_DIR/pending.jsonl" ]; then
-    sessions="[$(paste -sd ',' - < "$SESS_DIR/pending.jsonl")]"
-  fi
-  if [ -s "$SESS_DIR/pending-idle.jsonl" ]; then
-    idles="[$(paste -sd ',' - < "$SESS_DIR/pending-idle.jsonl")]"
-  fi
-  # sesión en curso (upsert)
-  if [ -f "$CUR_S" ]; then
-    . "$CUR_S"; now_iso=$(now_iso)
-    st=$(date -u -j -f "%Y-%m-%dT%H:%M:%SZ" "$SS_STARTED" +%s 2>/dev/null || echo 0)
-    et=$(date -u +%s); dur=$((et-st))
-    if [ "$dur" -gt 0 ]; then
-      obj=$(printf '{"session_uuid":"%s","application_name":"%s","process_name":"%s","started_at":"%s","ended_at":"%s","duration_seconds":%s,"foreground":true,"window_visible":true,"idle_interrupted":false,"os_user":"%s"}' \
-        "$SS_UUID" "$(json_escape "$SS_APP")" "$(json_escape "$SS_APP")" "$SS_STARTED" "$now_iso" "$dur" "$(json_escape "$SS_USER")")
-      if [ "$sessions" = "[]" ]; then sessions="[$obj]"; else sessions=$(printf '%s' "$sessions" | sed 's/\]$/,'"$(printf '%s' "$obj" | sed 's/[\/&]/\\&/g')"']/'); fi
+  # sesión / idle en curso → upsert por UUID
+  now_iso=$(now_iso)
+  if [ -d "$CUR_S" ]; then
+    su=$(rf "$CUR_S" uuid); sa=$(rf "$CUR_S" app); ss=$(rf "$CUR_S" started); sus=$(rf "$CUR_S" user)
+    if [ -n "$su" ]; then
+      st=$(iso_to_epoch_arm "$ss"); et=$(date -u +%s); dur=$((et-st))
+      if [ "$dur" -gt 0 ]; then
+        printf '{"session_uuid":"%s","application_name":"%s","process_name":"%s","started_at":"%s","ended_at":"%s","duration_seconds":%s,"foreground":true,"window_visible":true,"idle_interrupted":false,"os_user":"%s"}\n' \
+          "$su" "$(json_escape "$sa")" "$(json_escape "$sa")" "$ss" "$now_iso" "$dur" "$(json_escape "$sus")" >> "$SESS_DIR/pending.jsonl"
+      fi
     fi
   fi
-  if [ -f "$CUR_I" ]; then
-    . "$CUR_I"
-    obj=$(printf '{"session_uuid":"%s","started_at":"%s","ended_at":null,"duration_seconds":null,"reason":"idle","os_user":"%s"}' \
-      "$II_UUID" "$II_STARTED" "$(json_escape "$II_USER")")
-    if [ "$idles" = "[]" ]; then idles="[$obj]"; else idles=$(printf '%s' "$idles" | sed 's/\]$/,'"$(printf '%s' "$obj" | sed 's/[\/&]/\\&/g')"']/'); fi
+  if [ -d "$CUR_I" ]; then
+    iu=$(rf "$CUR_I" uuid); is=$(rf "$CUR_I" started); iuser=$(rf "$CUR_I" user)
+    if [ -n "$iu" ]; then
+      printf '{"session_uuid":"%s","started_at":"%s","ended_at":null,"duration_seconds":null,"reason":"idle","os_user":"%s"}\n' \
+        "$iu" "$is" "$(json_escape "$iuser")" >> "$SESS_DIR/pending-idle.jsonl"
+    fi
   fi
+  if [ ! -s "$SESS_DIR/pending.jsonl" ] && [ ! -s "$SESS_DIR/pending-idle.jsonl" ]; then
+    return 0
+  fi
+  sessions=$(jsonl_arr "$SESS_DIR/pending.jsonl")
+  idles=$(jsonl_arr "$SESS_DIR/pending-idle.jsonl")
   payload=$(printf '{"agent_version":"%s","sessions":%s,"idle_sessions":%s}' "$AGENT_VERSION" "$sessions" "$idles")
-  post_json "$SESSIONS_URL" "$payload" >/dev/null 2>&1 || return 0
-  rm -f "$SESS_DIR/pending.jsonl" "$SESS_DIR/pending-idle.jsonl"
+  if post_json "$SESSIONS_URL" "$payload" >/dev/null 2>&1; then
+    rm -f "$SESS_DIR/pending.jsonl" "$SESS_DIR/pending-idle.jsonl"
+  fi
 }
 trap 'rm -f "$RESP_FILE"' EXIT
 echo "[$(now_iso)] torobyte-agent (arm64) $AGENT_VERSION started interval=${INTERVAL}s"
