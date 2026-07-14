@@ -479,25 +479,21 @@ open_apps() {
   cu=$(console_user)
   uid=$(id -u "$cu" 2>/dev/null || echo "")
   {
-    # 1) Apps GUI vía AppleScript (nombres "amigables" tipo "Google Chrome")
+    # Sólo apps GUI del usuario (ventanas/aplicaciones visibles para el usuario).
+    # No usamos ps aquí: eso mezcla helpers, agentes y procesos de sistema.
     if [ -n "$uid" ] && command -v launchctl >/dev/null 2>&1; then
       launchctl asuser "$uid" sudo -u "$cu" osascript -e 'tell application "System Events" to get name of every application process whose background only is false' 2>/dev/null | tr ',' '\n' | sed 's/^ *//;s/ *$//'
     fi
-    # 2) Todos los .app en ejecución (incluye background bundles)
-    ps -axo comm= 2>/dev/null | awk -F/ '/\.app\// {for(i=1;i<=NF;i++) if($i ~ /\.app$/){sub(/\.app$/,"",$i); print $i}}'
-    # 3) Todos los procesos ejecutados por el usuario (para captar Electron/CLI)
-    #    Filtramos ruido de kernel y helpers.
+    # Fallback sin permisos de Accesibilidad: extrae sólo bundles .app del
+    # usuario de consola, no procesos sueltos del sistema.
     ps -axo user=,comm= 2>/dev/null | awk -v u="$cu" '$1==u {
-      $1="";
-      sub(/^ */,"");
-      n=$0;
-      # último componente del path
-      m=split(n,a,"/"); base=a[m];
-      # ignorar helpers y binarios internos
-      if (base ~ /^(launchd|com\.apple|WindowServer|loginwindow|distnoted|cfprefsd|mds|coreaudiod|Dock|SystemUIServer|xpcproxy|nsurlsessiond|trustd|secd|sharingd|CommCenter|MTLCompilerService|softwareupdated)$/) next;
-      if (base ~ /Helper$/ || base ~ /XPC/ || base ~ /ExtensionService/) next;
-      if (length(base) < 2) next;
-      print base;
+      $1=""; sub(/^ */,"");
+      if ($0 !~ /\.app\//) next;
+      n=split($0,a,"/");
+      for(i=1;i<=n;i++) if(a[i] ~ /\.app$/){ app=a[i]; sub(/\.app$/,"",app); break; }
+      if (app=="" || app ~ /^(Dock|Finder|SystemUIServer|ControlCenter|NotificationCenter)$/) next;
+      if (app ~ /(Helper|Agent|Daemon|Service)$/) next;
+      print app; app="";
     }'
   } | awk 'NF && !seen[$0]++ {print}'
 }
@@ -563,7 +559,7 @@ build_apps_body() {
     case "$b" in "$pa"*) printf '%s\n' "${b#$pa}" ;; "$po"*) printf '%s\n' "${b#$po}" ;; esac
   done | sort -u)
   [ -z "$names" ] && return 1
-  printf '{"date":"%s","apps":[' "$day"
+  printf '{"date":"%s","mode":"delta","apps":[' "$day"
   first=1
   for n in $names; do
     active=0; open=0; fs=""; ls_=""
@@ -580,7 +576,7 @@ build_apps_body() {
     done
     [ "$first" = "1" ] || printf ','
     first=0
-    printf '{"key":"%s","label":"%s","seconds_active":%s,"seconds_open":%s,"first_seen":"%s","last_seen":"%s"}' \
+    printf '{"key":"%s","label":"%s","source":"gui","seconds_active":%s,"seconds_open":%s,"first_seen":"%s","last_seen":"%s"}' \
       "$(json_escape "$n")" "$(json_escape "$label")" "${active:-0}" "${open:-0}" "$(json_escape "$fs")" "$(json_escape "$ls_")"
   done
   printf ']}'
