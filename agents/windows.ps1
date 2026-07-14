@@ -25,6 +25,8 @@ $InstallDir   = Join-Path $env:ProgramData 'TorobyteAgent'
 $ScriptPath   = Join-Path $InstallDir 'torobyte-agent.ps1'
 $LogPath      = Join-Path $InstallDir 'agent.log'
 $TaskName     = 'TorobyteAgent'
+$SessionsTaskName = 'TorobyteAgentSessions'
+$SessionsCmdPath  = Join-Path $InstallDir 'torobyte-sessions.cmd'
 
 function W-Log($msg) {
   $line = "[$((Get-Date).ToString('o'))] $msg"
@@ -997,8 +999,9 @@ function Install-Agent {
   $env:ONCE = ''
   W-Ok 'OK - el servidor pasara a "en linea"'
 
-  W-Step 6 $total 'Registrando tarea programada (TorobyteAgent)...'
+  W-Step 6 $total 'Registrando tareas programadas (TorobyteAgent + Sessions)...'
   & schtasks.exe /Delete /TN $TaskName /F 2>$null | Out-Null
+  & schtasks.exe /Delete /TN $SessionsTaskName /F 2>$null | Out-Null
   # Persistir variables a nivel de maquina para que la tarea las herede
   [Environment]::SetEnvironmentVariable('AGENT_TOKEN', $Token,    'Machine')
   [Environment]::SetEnvironmentVariable('INGEST_URL',  $Url,      'Machine')
@@ -1006,11 +1009,20 @@ function Install-Agent {
   [Environment]::SetEnvironmentVariable('MODE',        'run',     'Machine')
   $action = 'powershell.exe -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File "' + $ScriptPath + '"'
   & schtasks.exe /Create /TN $TaskName /SC ONSTART /RL HIGHEST /RU SYSTEM /F /TR $action | Out-Null
-  if ($LASTEXITCODE -ne 0) { W-Fail 'no se pudo crear la tarea programada' }
-  W-Ok 'tarea creada'
+  if ($LASTEXITCODE -ne 0) { W-Fail 'no se pudo crear la tarea programada del sistema' }
+
+  # Tarea por-usuario (ONLOGON) para capturar la aplicacion en primer plano.
+  # SYSTEM esta en Session 0 y no puede ver el escritorio interactivo, por eso
+  # se requiere una tarea separada que corra como el usuario que inicia sesion.
+  $cmdLines = @('@echo off', 'set MODE=run-sessions', ('powershell.exe -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File "' + $ScriptPath + '"'))
+  Set-Content -Encoding ASCII -Path $SessionsCmdPath -Value $cmdLines
+  & schtasks.exe /Create /TN $SessionsTaskName /SC ONLOGON /RL LIMITED /F /TR $SessionsCmdPath | Out-Null
+  if ($LASTEXITCODE -ne 0) { W-Log 'aviso: no se pudo crear la tarea de sesiones por-usuario (metricas de apps deshabilitadas)' }
+  W-Ok 'tareas creadas'
 
   W-Step 7 $total 'Iniciando agente en background...'
   & schtasks.exe /Run /TN $TaskName | Out-Null
+  & schtasks.exe /Run /TN $SessionsTaskName 2>$null | Out-Null
   Start-Sleep -Seconds 2
   $proc = Get-Process powershell -ErrorAction SilentlyContinue | Where-Object {
     try { $_.Path -and $_.CommandLine -match 'torobyte-agent.ps1' } catch { $false }
@@ -1033,7 +1045,9 @@ function Uninstall-Agent {
   if (-not $isAdmin) { W-Fail 'Ejecuta PowerShell como Administrador' }
   & schtasks.exe /End /TN $TaskName 2>$null | Out-Null
   & schtasks.exe /Delete /TN $TaskName /F 2>$null | Out-Null
-  W-Ok 'tarea programada eliminada'
+  & schtasks.exe /End /TN $SessionsTaskName 2>$null | Out-Null
+  & schtasks.exe /Delete /TN $SessionsTaskName /F 2>$null | Out-Null
+  W-Ok 'tareas programadas eliminadas'
   Get-Process powershell -ErrorAction SilentlyContinue | Where-Object {
     try { $_.CommandLine -match 'torobyte-agent.ps1' } catch { $false }
   } | ForEach-Object { try { Stop-Process -Id $_.Id -Force -ErrorAction SilentlyContinue } catch {} }
@@ -1050,9 +1064,35 @@ function Uninstall-Agent {
   Write-Host ""
 }
 
+function Run-SessionsLoop {
+  if (-not $Token -or -not $Url) { W-Log 'sessions loop: token/url faltantes'; exit 1 }
+  $sessionsUrl = Get-IngestEndpoint 'sessions'
+  W-Log "torobyte-agent sessions loop $AgentVersion interval=$Interval user=$([Environment]::UserName)"
+  while ($true) {
+    try {
+      $slept = 0
+      $step = $Script:_sessionSampleSec
+      while ($slept -lt $script:Interval) {
+        try { Sample-Session } catch { W-Log "session sample error: $($_.Exception.Message)" }
+        Start-Sleep -Seconds $step
+        $slept += $step
+      }
+      try {
+        $sPayload = Build-SessionsPayload
+        if ($sPayload.sessions.Count -gt 0 -or $sPayload.idle_sessions.Count -gt 0) {
+          Post-Json $sessionsUrl $sPayload | Out-Null
+          Reset-SessionQueues
+        }
+      } catch { W-Log "sessions post error: $($_.Exception.Message)" }
+    } catch { W-Log "sessions loop error: $($_.Exception.Message)" }
+  }
+}
+
 # Modo de ejecucion
 if ($Mode -eq 'run') {
   Run-AgentLoop
+} elseif ($Mode -eq 'run-sessions') {
+  Run-SessionsLoop
 } elseif ($Mode -eq 'uninstall' -or $Mode -eq 'remove') {
   Uninstall-Agent
 } else {
