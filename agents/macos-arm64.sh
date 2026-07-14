@@ -329,7 +329,16 @@ sample_apps() {
 
 build_apps_body() {
   day=$(date -u +%Y-%m-%d)
-  names=$(for f in "$APPS_STATE_DIR/$day.active."* "$APPS_STATE_DIR/$day.open."*; do [ -e "$f" ] || continue; b=$(basename "$f"); pa="$day.active."; po="$day.open."; case "$b" in "$pa"*) printf '%s\n' "${b#$pa}" ;; "$po"*) printf '%s\n' "${b#$po}" ;; esac; done | sort -u)
+  names=$(for f in "$APPS_STATE_DIR/$day.active."* "$APPS_STATE_DIR/$day.open."*; do
+    [ -e "$f" ] || continue
+    b=$(basename "$f")
+    pa="$day.active."
+    po="$day.open."
+    case "$b" in
+      "$pa"*) printf '%s\n' "${b#$pa}" ;;
+      "$po"*) printf '%s\n' "${b#$po}" ;;
+    esac
+  done | sort -u)
   [ -z "$names" ] && return 1
   printf '{"date":"%s","mode":"delta","apps":[' "$day"
   first=1
