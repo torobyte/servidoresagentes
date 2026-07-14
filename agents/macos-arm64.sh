@@ -7,7 +7,7 @@ AGENT_TOKEN="${AGENT_TOKEN:-${TOKEN:-}}"
 INGEST_URL="${INGEST_URL:-${URL:-}}"
 INTERVAL="${INTERVAL:-5}"
 ONCE="${ONCE:-0}"
-AGENT_VERSION="1.7.1-macos-arm64"
+AGENT_VERSION="1.7.2-macos-arm64"
 MODE="${1:-run}"
 
 INSTALL_DIR="/usr/local/torobyte-agent"
@@ -268,8 +268,8 @@ collect_disks() {
 
 # -------------------------- Aplicaciones (uso) --------------------------
 APPS_STATE_DIR="${TMPDIR:-/tmp}/torobyte-apps"
-APP_SAMPLE=5
 mkdir -p "$APPS_STATE_DIR" 2>/dev/null || true
+APP_LAST_SAMPLE_FILE="$APPS_STATE_DIR/last-sample"
 
 console_user() { stat -f %Su /dev/console 2>/dev/null | tr -d '\n'; }
 
@@ -286,42 +286,55 @@ foreground_app() {
 open_apps() {
   cu=$(console_user)
   uid=$(id -u "$cu" 2>/dev/null || echo "")
-  if [ -n "$uid" ] && command -v launchctl >/dev/null 2>&1; then
-    launchctl asuser "$uid" sudo -u "$cu" osascript -e 'tell application "System Events" to get name of every application process whose background only is false' 2>/dev/null | tr ',' '\n' | sed 's/^ *//;s/ *$//' | awk 'NF && !seen[$0]++ {print}' && return 0
-  fi
-  ps -axo comm= 2>/dev/null | awk -F/ '/\.app\// {for(i=1;i<=NF;i++) if($i ~ /\.app$/){sub(/\.app$/,"",$i); print $i}}' | awk 'NF && !seen[$0]++ {print}'
+  {
+    if [ -n "$uid" ] && command -v launchctl >/dev/null 2>&1; then
+      launchctl asuser "$uid" sudo -u "$cu" osascript -e 'tell application "System Events" to get name of every application process whose background only is false' 2>/dev/null | tr ',' '\n' | sed 's/^ *//;s/ *$//'
+    fi
+    ps -axo comm= 2>/dev/null | awk -F/ '/\.app\// {for(i=1;i<=NF;i++) if($i ~ /\.app$/){sub(/\.app$/,"",$i); print $i}}'
+    ps -axo user=,comm= 2>/dev/null | awk -v u="$cu" '$1==u { $1=""; sub(/^ */,""); m=split($0,a,"/"); base=a[m]; if (base ~ /^(launchd|com\.apple|WindowServer|loginwindow|distnoted|cfprefsd|mds|coreaudiod|Dock|SystemUIServer|xpcproxy|nsurlsessiond|trustd|secd|sharingd|CommCenter|MTLCompilerService|softwareupdated)$/) next; if (base ~ /Helper$/ || base ~ /XPC/ || base ~ /ExtensionService/) next; if (length(base) < 2) next; print base; }'
+  } | awk 'NF && !seen[$0]++ {print}'
 }
 
-app_key() { printf '%s' "$1" | tr 'A-Z' 'a-z' | tr -c 'a-z0-9._-' '_'; }
+app_key() {
+  if command -v iconv >/dev/null 2>&1; then
+    printf '%s' "$1" | iconv -f UTF-8 -t ASCII//TRANSLIT 2>/dev/null
+  else
+    printf '%s' "$1"
+  fi | tr 'A-Z' 'a-z' | tr -c 'a-z0-9._-' '_' | tr -s '_' | sed 's/^_*//;s/_*$//' | cut -c1-60
+}
+sample_delta() { now=$(date +%s); last=0; [ -f "$APP_LAST_SAMPLE_FILE" ] && last=$(cat "$APP_LAST_SAMPLE_FILE" 2>/dev/null | tr -cd 0-9); echo "$now" > "$APP_LAST_SAMPLE_FILE" 2>/dev/null || true; if [ -z "$last" ] || [ "$last" -le 0 ]; then delta="${INTERVAL:-5}"; else delta=$((now-last)); fi; [ "$delta" -lt 1 ] && delta=1; [ "$delta" -gt 300 ] && delta=300; printf '%s' "$delta"; }
 bump() { f="$1"; delta="$2"; cur=0; [ -f "$f" ] && cur=$(cat "$f" 2>/dev/null | tr -cd 0-9); [ -z "$cur" ] && cur=0; echo $((cur + delta)) > "$f"; }
-touch_seen() { day="$1"; kind="$2"; name="$3"; nowiso="$4"; fs="$APPS_STATE_DIR/$day.first.$kind.$name"; ls_="$APPS_STATE_DIR/$day.last.$kind.$name"; [ -f "$fs" ] || echo "$nowiso" > "$fs"; echo "$nowiso" > "$ls_"; }
+touch_seen() { day="$1"; kind="$2"; name="$3"; nowiso="$4"; label="${5:-$3}"; fs="$APPS_STATE_DIR/$day.first.$kind.$name"; ls_="$APPS_STATE_DIR/$day.last.$kind.$name"; lb="$APPS_STATE_DIR/$day.label.$name"; [ -f "$fs" ] || echo "$nowiso" > "$fs"; echo "$nowiso" > "$ls_"; [ -f "$lb" ] || printf '%s' "$label" > "$lb"; }
 
 sample_apps() {
   day=$(date -u +%Y-%m-%d); nowiso=$(now_iso)
+  delta=$(sample_delta)
   fg=$(foreground_app 2>/dev/null || true)
-  if [ -n "$fg" ]; then safe=$(app_key "$fg"); bump "$APPS_STATE_DIR/$day.active.$safe" "$APP_SAMPLE"; touch_seen "$day" "active" "$safe" "$nowiso"; fi
+  if [ -n "$fg" ]; then safe=$(app_key "$fg"); [ -n "$safe" ] && bump "$APPS_STATE_DIR/$day.active.$safe" "$delta"; [ -n "$safe" ] && touch_seen "$day" "active" "$safe" "$nowiso" "$fg"; fi
   open_apps 2>/dev/null | while IFS= read -r name; do
     [ -n "$name" ] || continue
     safe=$(app_key "$name")
-    bump "$APPS_STATE_DIR/$day.open.$safe" "$APP_SAMPLE"
-    touch_seen "$day" "open" "$safe" "$nowiso"
+    [ -n "$safe" ] || continue
+    bump "$APPS_STATE_DIR/$day.open.$safe" "$delta"
+    touch_seen "$day" "open" "$safe" "$nowiso" "$name"
   done
 }
 
 build_apps_body() {
   day=$(date -u +%Y-%m-%d)
-  names=$(ls "$APPS_STATE_DIR" 2>/dev/null | awk -F. -v d="$day" '$1==d && ($2=="active" || $2=="open") {print $3}' | sort -u)
+  names=$(for f in "$APPS_STATE_DIR/$day.active."* "$APPS_STATE_DIR/$day.open."*; do [ -e "$f" ] || continue; b=$(basename "$f"); pa="$day.active."; po="$day.open."; case "$b" in "$pa"*) printf '%s\n' "${b#$pa}" ;; "$po"*) printf '%s\n' "${b#$po}" ;; esac; done | sort -u)
   [ -z "$names" ] && return 1
   printf '{"date":"%s","apps":[' "$day"
   first=1
   for n in $names; do
     active=0; open=0; fs=""; ls_=""
+    label="$n"; [ -f "$APPS_STATE_DIR/$day.label.$n" ] && label=$(cat "$APPS_STATE_DIR/$day.label.$n" 2>/dev/null)
     [ -f "$APPS_STATE_DIR/$day.active.$n" ] && active=$(cat "$APPS_STATE_DIR/$day.active.$n" 2>/dev/null | tr -cd 0-9)
     [ -f "$APPS_STATE_DIR/$day.open.$n" ] && open=$(cat "$APPS_STATE_DIR/$day.open.$n" 2>/dev/null | tr -cd 0-9)
     for k in active open; do f="$APPS_STATE_DIR/$day.first.$k.$n"; [ -f "$f" ] && { fs=$(cat "$f" 2>/dev/null); break; }; done
     for k in active open; do l="$APPS_STATE_DIR/$day.last.$k.$n"; [ -f "$l" ] && ls_=$(cat "$l" 2>/dev/null); done
     [ "$first" = "1" ] || printf ','; first=0
-    printf '{"key":"%s","label":"%s","seconds_active":%s,"seconds_open":%s,"first_seen":"%s","last_seen":"%s"}' "$(json_escape "$n")" "$(json_escape "$n")" "${active:-0}" "${open:-0}" "$(json_escape "$fs")" "$(json_escape "$ls_")"
+    printf '{"key":"%s","label":"%s","seconds_active":%s,"seconds_open":%s,"first_seen":"%s","last_seen":"%s"}' "$(json_escape "$n")" "$(json_escape "$label")" "${active:-0}" "${open:-0}" "$(json_escape "$fs")" "$(json_escape "$ls_")"
   done
   printf ']}'
 }
