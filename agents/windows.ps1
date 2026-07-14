@@ -547,10 +547,10 @@ function Get-ForegroundAppName {
   try {
     $hwnd = [ToroForegroundWin]::GetForegroundWindow()
     if ($hwnd -eq [IntPtr]::Zero) { return $null }
-    $pid = 0
-    [void][ToroForegroundWin]::GetWindowThreadProcessId($hwnd, [ref]$pid)
-    if ($pid -le 0) { return $null }
-    $p = Get-Process -Id $pid -ErrorAction SilentlyContinue
+    $procId = 0
+    [void][ToroForegroundWin]::GetWindowThreadProcessId($hwnd, [ref]$procId)
+    if ($procId -le 0) { return $null }
+    $p = Get-Process -Id $procId -ErrorAction SilentlyContinue
     if (Test-UserFacingProcess $p) { return (Get-AppDisplayName $p) }
   } catch {}
   return $null
@@ -629,19 +629,23 @@ function Get-ForegroundSessionInfo {
   try {
     $hwnd = [ToroForegroundWin]::GetForegroundWindow()
     if ($hwnd -eq [IntPtr]::Zero) { return $null }
-    $pid = 0
-    [void][ToroForegroundWin]::GetWindowThreadProcessId($hwnd, [ref]$pid)
-    if ($pid -le 0) { return $null }
-    $p = Get-Process -Id $pid -ErrorAction SilentlyContinue
+    $procId = 0
+    [void][ToroForegroundWin]::GetWindowThreadProcessId($hwnd, [ref]$procId)
+    if ($procId -le 0) { return $null }
+    $p = Get-Process -Id $procId -ErrorAction SilentlyContinue
     if (-not (Test-UserFacingProcess $p)) { return $null }
     $sb = New-Object System.Text.StringBuilder 512
     [void][ToroForegroundWin]::GetWindowText($hwnd, $sb, 512)
+    $procName = $null
+    try { $procName = $p.ProcessName } catch {}
+    $osUser = $null
+    try { $osUser = [Environment]::UserName } catch {}
     return @{
       app_name = (Get-AppDisplayName $p)
-      process_name = try { $p.ProcessName } catch { $null }
-      pid = $pid
+      process_name = $procName
+      pid = $procId
       window_title = $sb.ToString()
-      os_user = try { [Environment]::UserName } catch { $null }
+      os_user = $osUser
     }
   } catch {}
   return $null
