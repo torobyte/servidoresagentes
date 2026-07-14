@@ -14,7 +14,7 @@ AGENT_TOKEN="${AGENT_TOKEN:-${TOKEN:-}}"
 INGEST_URL="${INGEST_URL:-${URL:-}}"
 INTERVAL="${INTERVAL:-5}"
 ONCE="${ONCE:-0}"
-AGENT_VERSION="2.0.0-macos"
+AGENT_VERSION="2.0.1-macos"
 MODE="${1:-run}"
 
 INSTALL_DIR="/usr/local/torobyte-agent"
@@ -453,6 +453,7 @@ PORTS_URL=$(derive_ingest_url ports)
 DISKS_URL=$(derive_ingest_url disks)
 SERVICES_URL=$(derive_ingest_url services)
 APPS_URL=$(derive_ingest_url apps)
+SESSIONS_URL=$(derive_ingest_url sessions)
 
 # -------------------------- Aplicaciones (uso) --------------------------
 APPS_STATE_DIR="${TMPDIR:-/tmp}/torobyte-apps"
@@ -591,6 +592,141 @@ send_apps() {
   rm -f "$APPS_STATE_DIR/$day.active."* "$APPS_STATE_DIR/$day.open."* 2>/dev/null || true
 }
 
+# -------------- Sesiones foreground v2.0.0 (idempotentes por UUID) --------------
+SESSIONS_STATE_DIR="${TMPDIR:-/tmp}/torobyte-sessions"
+mkdir -p "$SESSIONS_STATE_DIR" 2>/dev/null || true
+SESSIONS_FILE="$SESSIONS_STATE_DIR/queue.json"
+IDLE_FILE="$SESSIONS_STATE_DIR/idle.json"
+CUR_SESSION_FILE="$SESSIONS_STATE_DIR/current.env"
+CUR_IDLE_FILE="$SESSIONS_STATE_DIR/current-idle.env"
+IDLE_THRESHOLD_SEC="${IDLE_THRESHOLD_SECONDS:-180}"
+SESSION_SAMPLE_SEC="${SESSION_SAMPLE_SECONDS:-3}"
+[ "$SESSION_SAMPLE_SEC" -lt 1 ] 2>/dev/null && SESSION_SAMPLE_SEC=1
+[ -f "$SESSIONS_FILE" ] || echo "[]" > "$SESSIONS_FILE"
+[ -f "$IDLE_FILE" ] || echo "[]" > "$IDLE_FILE"
+
+new_uuid() {
+  if command -v uuidgen >/dev/null 2>&1; then uuidgen | tr 'A-Z' 'a-z'
+  else python3 -c 'import uuid;print(uuid.uuid4())' 2>/dev/null || printf '%s-%s-4%s-%s-%s\n' "$(openssl rand -hex 4)" "$(openssl rand -hex 2)" "$(openssl rand -hex 3 | cut -c2-)" "$(openssl rand -hex 2)" "$(openssl rand -hex 6)"
+  fi
+}
+
+idle_seconds() {
+  ioreg -c IOHIDSystem 2>/dev/null | awk '/HIDIdleTime/ {print int($NF/1000000000); exit}' | tr -cd 0-9
+}
+
+foreground_process() {
+  cu=$(console_user)
+  [ -n "$cu" ] && [ "$cu" != "root" ] || return 0
+  uid=$(id -u "$cu" 2>/dev/null || echo "")
+  if [ -n "$uid" ] && command -v launchctl >/dev/null 2>&1; then
+    launchctl asuser "$uid" sudo -u "$cu" osascript -e 'tell application "System Events" to unix id of first application process whose frontmost is true' 2>/dev/null | tr -cd 0-9
+  fi
+}
+
+json_append_array() {
+  # $1 file  $2 json object
+  f="$1"; obj="$2"
+  if [ ! -s "$f" ] || [ "$(cat "$f")" = "[]" ]; then
+    printf '[%s]' "$obj" > "$f"
+  else
+    tmp="$f.tmp"
+    sed 's/\]$/,'"$(printf '%s' "$obj" | sed 's/[\/&]/\\&/g')"']/' "$f" > "$tmp" 2>/dev/null && mv "$tmp" "$f"
+  fi
+}
+
+close_current_session() {
+  end_iso="$1"; interrupted="${2:-false}"
+  [ -f "$CUR_SESSION_FILE" ] || return 0
+  . "$CUR_SESSION_FILE"
+  start_ts=$(date -u -j -f "%Y-%m-%dT%H:%M:%SZ" "$SESSION_STARTED" +%s 2>/dev/null || echo 0)
+  end_ts=$(date -u -j -f "%Y-%m-%dT%H:%M:%SZ" "$end_iso" +%s 2>/dev/null || date -u +%s)
+  dur=$((end_ts - start_ts))
+  [ "$dur" -le 0 ] && { rm -f "$CUR_SESSION_FILE"; return 0; }
+  obj=$(printf '{"session_uuid":"%s","application_name":"%s","process_name":"%s","bundle_id":null,"window_title":null,"started_at":"%s","ended_at":"%s","duration_seconds":%s,"foreground":true,"window_visible":true,"idle_interrupted":%s,"os_user":"%s"}' \
+    "$SESSION_UUID" "$(json_escape "$SESSION_APP")" "$(json_escape "$SESSION_PROC")" "$SESSION_STARTED" "$end_iso" "$dur" "$interrupted" "$(json_escape "$SESSION_USER")")
+  json_append_array "$SESSIONS_FILE" "$obj"
+  rm -f "$CUR_SESSION_FILE"
+}
+
+sample_session() {
+  now_iso=$(now_iso)
+  idle=$(idle_seconds); [ -z "$idle" ] && idle=0
+  if [ "$idle" -ge "$IDLE_THRESHOLD_SEC" ]; then
+    [ -f "$CUR_SESSION_FILE" ] && close_current_session "$now_iso" true
+    if [ ! -f "$CUR_IDLE_FILE" ]; then
+      uuid=$(new_uuid)
+      cu=$(console_user)
+      printf 'IDLE_UUID=%s\nIDLE_STARTED=%s\nIDLE_USER=%s\n' "$uuid" "$now_iso" "$cu" > "$CUR_IDLE_FILE"
+    fi
+    return 0
+  fi
+  if [ -f "$CUR_IDLE_FILE" ]; then
+    . "$CUR_IDLE_FILE"
+    ist=$(date -u -j -f "%Y-%m-%dT%H:%M:%SZ" "$IDLE_STARTED" +%s 2>/dev/null || echo 0)
+    iet=$(date -u -j -f "%Y-%m-%dT%H:%M:%SZ" "$now_iso" +%s 2>/dev/null || date -u +%s)
+    idur=$((iet - ist))
+    obj=$(printf '{"session_uuid":"%s","started_at":"%s","ended_at":"%s","duration_seconds":%s,"reason":"idle","os_user":"%s"}' \
+      "$IDLE_UUID" "$IDLE_STARTED" "$now_iso" "$idur" "$(json_escape "$IDLE_USER")")
+    json_append_array "$IDLE_FILE" "$obj"
+    rm -f "$CUR_IDLE_FILE"
+  fi
+  fg_name=$(foreground_app 2>/dev/null || true)
+  [ -z "$fg_name" ] && return 0
+  fg_pid=$(foreground_process 2>/dev/null || true)
+  cu=$(console_user)
+  if [ -f "$CUR_SESSION_FILE" ]; then
+    . "$CUR_SESSION_FILE"
+    if [ "$SESSION_APP" = "$fg_name" ]; then
+      return 0
+    fi
+    close_current_session "$now_iso" false
+  fi
+  uuid=$(new_uuid)
+  proc="$fg_name"
+  {
+    printf 'SESSION_UUID=%s\n' "$uuid"
+    printf 'SESSION_APP=%s\n' "$fg_name"
+    printf 'SESSION_PROC=%s\n' "$proc"
+    printf 'SESSION_STARTED=%s\n' "$now_iso"
+    printf 'SESSION_USER=%s\n' "$cu"
+  } > "$CUR_SESSION_FILE"
+}
+
+build_sessions_payload() {
+  sessions="[]"; idles="[]"
+  [ -s "$SESSIONS_FILE" ] && sessions=$(cat "$SESSIONS_FILE")
+  [ -s "$IDLE_FILE" ] && idles=$(cat "$IDLE_FILE")
+  # Añadir sesión en curso (upsert por UUID)
+  if [ -f "$CUR_SESSION_FILE" ]; then
+    . "$CUR_SESSION_FILE"
+    now_iso=$(now_iso)
+    st=$(date -u -j -f "%Y-%m-%dT%H:%M:%SZ" "$SESSION_STARTED" +%s 2>/dev/null || echo 0)
+    et=$(date -u -j -f "%Y-%m-%dT%H:%M:%SZ" "$now_iso" +%s 2>/dev/null || date -u +%s)
+    dur=$((et - st))
+    if [ "$dur" -gt 0 ]; then
+      obj=$(printf '{"session_uuid":"%s","application_name":"%s","process_name":"%s","bundle_id":null,"window_title":null,"started_at":"%s","ended_at":"%s","duration_seconds":%s,"foreground":true,"window_visible":true,"idle_interrupted":false,"os_user":"%s"}' \
+        "$SESSION_UUID" "$(json_escape "$SESSION_APP")" "$(json_escape "$SESSION_PROC")" "$SESSION_STARTED" "$now_iso" "$dur" "$(json_escape "$SESSION_USER")")
+      if [ "$sessions" = "[]" ]; then sessions="[$obj]"; else sessions=$(printf '%s' "$sessions" | sed 's/\]$/,'"$(printf '%s' "$obj" | sed 's/[\/&]/\\&/g')"']/'); fi
+    fi
+  fi
+  if [ -f "$CUR_IDLE_FILE" ]; then
+    . "$CUR_IDLE_FILE"
+    obj=$(printf '{"session_uuid":"%s","started_at":"%s","ended_at":null,"duration_seconds":null,"reason":"idle","os_user":"%s"}' \
+      "$IDLE_UUID" "$IDLE_STARTED" "$(json_escape "$IDLE_USER")")
+    if [ "$idles" = "[]" ]; then idles="[$obj]"; else idles=$(printf '%s' "$idles" | sed 's/\]$/,'"$(printf '%s' "$obj" | sed 's/[\/&]/\\&/g')"']/'); fi
+  fi
+  printf '{"agent_version":"%s","sessions":%s,"idle_sessions":%s}' "$AGENT_VERSION" "$sessions" "$idles"
+}
+
+send_sessions() {
+  payload=$(build_sessions_payload)
+  post_json "$SESSIONS_URL" "$payload" >/dev/null 2>&1 || return 0
+  echo "[]" > "$SESSIONS_FILE"
+  echo "[]" > "$IDLE_FILE"
+}
+
+
 trap 'rm -f "$RESP_FILE"' EXIT
 echo "[$(now_iso)] torobyte-agent $AGENT_VERSION started interval=${INTERVAL}s endpoint=${INGEST_URL}"
 
@@ -664,5 +800,12 @@ while true; do
     APPS_LOOP=0
   fi
 
-  sleep "$INTERVAL"
+  # Sesiones foreground v2.0.0: sub-muestreo dentro del intervalo
+  SLEPT=0
+  while [ "$SLEPT" -lt "$INTERVAL" ]; do
+    sample_session 2>/dev/null || true
+    sleep "$SESSION_SAMPLE_SEC"
+    SLEPT=$((SLEPT + SESSION_SAMPLE_SEC))
+  done
+  send_sessions 2>/dev/null || true
 done
