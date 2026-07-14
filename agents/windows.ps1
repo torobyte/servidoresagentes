@@ -488,6 +488,7 @@ $Script:_appActive = @{}
 $Script:_appOpen = @{}
 $Script:_appFirst = @{}
 $Script:_appLast = @{}
+$Script:_appLabels = @{}
 $Script:_appLastSampleAt = $null
 
 try {
@@ -507,6 +508,27 @@ function Normalize-AppKey($name) {
   return $s
 }
 
+function Get-AppDisplayName($p) {
+  if (-not $p) { return $null }
+  try {
+    $desc = $p.MainModule.FileVersionInfo.FileDescription
+    if ($desc -and $desc.Trim().Length -gt 1) { return $desc.Trim() }
+  } catch {}
+  try {
+    if ($p.ProcessName) { return $p.ProcessName }
+  } catch {}
+  return $null
+}
+
+function Test-UserFacingProcess($p) {
+  if (-not $p) { return $false }
+  try { if ($p.MainWindowHandle -eq 0 -or -not $p.MainWindowTitle) { return $false } } catch { return $false }
+  $n = ("$($p.ProcessName)").ToLowerInvariant()
+  if ($n -match '^(system|idle|registry|memory compression|dwm|explorer|taskhostw|sihost|runtimebroker|searchhost|startmenuexperiencehost|applicationframehost|textinputhost|securityhealthsystray)$') { return $false }
+  if ($n -match '(helper|crashpad|updater|update|service|broker)$') { return $false }
+  return $true
+}
+
 function Get-ForegroundAppName {
   try {
     $hwnd = [ToroForegroundWin]::GetForegroundWindow()
@@ -515,16 +537,21 @@ function Get-ForegroundAppName {
     [void][ToroForegroundWin]::GetWindowThreadProcessId($hwnd, [ref]$pid)
     if ($pid -le 0) { return $null }
     $p = Get-Process -Id $pid -ErrorAction SilentlyContinue
-    if ($p) { return $p.ProcessName }
+    if (Test-UserFacingProcess $p) { return (Get-AppDisplayName $p) }
   } catch {}
   return $null
 }
 
 function Get-OpenAppNames {
   try {
-    return @(Get-Process -ErrorAction SilentlyContinue |
-      Where-Object { $_.MainWindowHandle -ne 0 -and $_.MainWindowTitle } |
-      Select-Object -ExpandProperty ProcessName -Unique)
+    $names = New-Object System.Collections.ArrayList
+    Get-Process -ErrorAction SilentlyContinue |
+      Where-Object { Test-UserFacingProcess $_ } |
+      ForEach-Object {
+        $name = Get-AppDisplayName $_
+        if ($name -and -not $names.Contains($name)) { [void]$names.Add($name) }
+      }
+    return ,$names.ToArray()
   } catch { return @() }
 }
 
@@ -534,6 +561,7 @@ function Add-AppSeconds($bucket, $name, [int]$seconds) {
   if (-not $key) { return }
   if (-not $bucket.ContainsKey($key)) { $bucket[$key] = 0 }
   $bucket[$key] = [int]$bucket[$key] + $seconds
+  if (-not $Script:_appLabels.ContainsKey($key)) { $Script:_appLabels[$key] = "$name" }
   $nowIso = (Get-Date).ToUniversalTime().ToString('o')
   if (-not $Script:_appFirst.ContainsKey($key)) { $Script:_appFirst[$key] = $nowIso }
   $Script:_appLast[$key] = $nowIso
@@ -550,14 +578,15 @@ function Build-AppsPayload {
   foreach ($k in $keys) {
     $apps += [pscustomobject]@{
       key = $k
-      label = $k
+      label = if ($Script:_appLabels.ContainsKey($k)) { $Script:_appLabels[$k] } else { $k }
+      source = 'gui'
       seconds_active = if ($Script:_appActive.ContainsKey($k)) { [int]$Script:_appActive[$k] } else { 0 }
       seconds_open = if ($Script:_appOpen.ContainsKey($k)) { [int]$Script:_appOpen[$k] } else { 0 }
       first_seen = if ($Script:_appFirst.ContainsKey($k)) { $Script:_appFirst[$k] } else { $null }
       last_seen = if ($Script:_appLast.ContainsKey($k)) { $Script:_appLast[$k] } else { $null }
     }
   }
-  return @{ date = (Get-Date).ToUniversalTime().ToString('yyyy-MM-dd'); apps = $apps }
+  return @{ date = (Get-Date).ToUniversalTime().ToString('yyyy-MM-dd'); mode = 'delta'; apps = $apps }
 }
 
 function Reset-AppCounters {
