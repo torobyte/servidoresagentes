@@ -14,7 +14,7 @@ $p=0;'Ssl3','Tls','Tls11','Tls12','Tls13'|%{try{$p=$p-bor[Net.SecurityProtocolTy
 try { [Net.ServicePointManager]::ServerCertificateValidationCallback = { $true } } catch {}
 $ErrorActionPreference = 'Continue'
 
-$AgentVersion = '1.7.1-windows'
+$AgentVersion = '1.7.2-windows'
 $Token        = if ($env:AGENT_TOKEN) { $env:AGENT_TOKEN } else { $env:TOKEN }
 $Url          = if ($env:INGEST_URL)  { $env:INGEST_URL }  else { $env:URL }
 $Interval     = if ($env:INTERVAL)    { [int]$env:INTERVAL } else { 5 }
@@ -369,7 +369,7 @@ function Collect-Processes {
     $procs = Get-Process -ErrorAction SilentlyContinue |
              Where-Object { $_.Id -gt 0 } |
              Sort-Object -Property CPU -Descending |
-             Select-Object -First 25
+             Select-Object -First 200
     $list = @()
     foreach ($p in $procs) {
       $list += [pscustomobject]@{
@@ -488,6 +488,7 @@ $Script:_appActive = @{}
 $Script:_appOpen = @{}
 $Script:_appFirst = @{}
 $Script:_appLast = @{}
+$Script:_appLastSampleAt = $null
 
 try {
   Add-Type @"
@@ -720,7 +721,16 @@ function Run-AgentLoop {
       Post-Json $portUrl @{ ports     = (Collect-Ports) }     | Out-Null
       Post-Json $diskUrl @{ disks     = (Collect-Disks) }     | Out-Null
       Post-Json $svcUrl  @{ services  = (Collect-Services) }  | Out-Null
-      Sample-Apps ([Math]::Max(5, [int]$script:Interval))
+      $sampleNow = Get-Date
+      if ($null -eq $Script:_appLastSampleAt) {
+        $sampleDelta = [Math]::Max(5, [int]$script:Interval)
+      } else {
+        $sampleDelta = [int][Math]::Round(($sampleNow - $Script:_appLastSampleAt).TotalSeconds)
+        if ($sampleDelta -lt 1) { $sampleDelta = 1 }
+        if ($sampleDelta -gt 300) { $sampleDelta = 300 }
+      }
+      $Script:_appLastSampleAt = $sampleNow
+      Sample-Apps $sampleDelta
       Post-Json $appsUrl (Build-AppsPayload) | Out-Null
       Reset-AppCounters
     } catch {
