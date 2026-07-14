@@ -278,10 +278,29 @@ foreground_app() {
   cu=$(console_user)
   [ -n "$cu" ] && [ "$cu" != "root" ] || return 0
   uid=$(id -u "$cu" 2>/dev/null || echo "")
-  if [ -n "$uid" ] && command -v launchctl >/dev/null 2>&1; then
-    launchctl asuser "$uid" sudo -u "$cu" osascript -e 'tell application "System Events" to name of first application process whose frontmost is true' 2>/dev/null && return 0
+  [ -n "$uid" ] || return 0
+  name=""
+  # 1) lsappinfo — no requiere permisos TCC de Accesibilidad
+  if command -v lsappinfo >/dev/null 2>&1; then
+    asn=$(launchctl asuser "$uid" sudo -u "$cu" lsappinfo front 2>/dev/null | tr -d '\n')
+    if [ -n "$asn" ]; then
+      name=$(launchctl asuser "$uid" sudo -u "$cu" lsappinfo info -only name "$asn" 2>/dev/null | sed -n 's/.*"LSDisplayName"="\([^"]*\)".*/\1/p' | head -1)
+    fi
   fi
-  sudo -u "$cu" osascript -e 'tell application "System Events" to name of first application process whose frontmost is true' 2>/dev/null || true
+  # 2) fallback osascript (Accesibilidad TCC)
+  if [ -z "$name" ] && command -v launchctl >/dev/null 2>&1; then
+    name=$(launchctl asuser "$uid" sudo -u "$cu" osascript -e 'tell application "System Events" to name of first application process whose frontmost is true' 2>/dev/null)
+  fi
+  # 3) fallback: ps con apps GUI del usuario
+  if [ -z "$name" ]; then
+    name=$(ps -axo user=,pcpu=,command= 2>/dev/null | awk -v u="$cu" '$1==u && $0 ~ /\.app\// {
+      cpu=$2; $1=""; $2=""; sub(/^ +/,"");
+      n=split($0,a,"/"); app="";
+      for(i=1;i<=n;i++) if(a[i] ~ /\.app$/){app=a[i]; sub(/\.app$/,"",app); break}
+      if (app!="" && app !~ /(Helper|Agent|Daemon|Service|XPC)$/) print cpu" "app
+    }' | sort -rn | head -1 | awk '{$1=""; sub(/^ +/,""); print}')
+  fi
+  [ -n "$name" ] && printf '%s' "$name"
 }
 
 open_apps() {
