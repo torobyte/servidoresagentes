@@ -7,7 +7,7 @@ AGENT_TOKEN="${AGENT_TOKEN:-${TOKEN:-}}"
 INGEST_URL="${INGEST_URL:-${URL:-}}"
 INTERVAL="${INTERVAL:-5}"
 ONCE="${ONCE:-0}"
-AGENT_VERSION="1.7.4-macos-arm64"
+AGENT_VERSION="2.0.0-macos-arm64"
 MODE="${1:-run}"
 
 INSTALL_DIR="/usr/local/torobyte-agent"
@@ -58,7 +58,8 @@ if [ "$MODE" = "install" ]; then
     }
     _dl_ok=0
     for _src in "$RAW_AGENT_URL" "$AGENT_SCRIPT_URL"; do
-      case "$_src" in ""|https://raw.githubusercontent.com/torobyte/servidoresagentes/main/agents/macos-arm64.sh) continue ;; esac
+      [ -n "$_src" ] || continue
+      [ "$_src" = "https://raw.githubusercontent.com/torobyte/servidoresagentes/main/agents/macos-arm64.sh" ] && continue
       if dl_agent "$_src"; then _dl_ok=1; ok "descargado desde $_src"; break; fi
       printf "      \033[1;33m!\033[0m descarga fallida desde %s, probando siguiente...\n" "$_src" >&2
     done
@@ -332,12 +333,7 @@ build_apps_body() {
   names=$(for f in "$APPS_STATE_DIR/$day.active."* "$APPS_STATE_DIR/$day.open."*; do
     [ -e "$f" ] || continue
     b=$(basename "$f")
-    pa="$day.active."
-    po="$day.open."
-    case "$b" in
-      "$pa"*) printf '%s\n' "${b#$pa}" ;;
-      "$po"*) printf '%s\n' "${b#$po}" ;;
-    esac
+    printf '%s\n' "$b" | sed "s/^$day\.active\.//;s/^$day\.open\.//"
   done | sort -u)
   [ -z "$names" ] && return 1
   printf '{"date":"%s","mode":"delta","apps":[' "$day"
