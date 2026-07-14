@@ -290,8 +290,15 @@ open_apps() {
     if [ -n "$uid" ] && command -v launchctl >/dev/null 2>&1; then
       launchctl asuser "$uid" sudo -u "$cu" osascript -e 'tell application "System Events" to get name of every application process whose background only is false' 2>/dev/null | tr ',' '\n' | sed 's/^ *//;s/ *$//'
     fi
-    ps -axo comm= 2>/dev/null | awk -F/ '/\.app\// {for(i=1;i<=NF;i++) if($i ~ /\.app$/){sub(/\.app$/,"",$i); print $i}}'
-    ps -axo user=,comm= 2>/dev/null | awk -v u="$cu" '$1==u { $1=""; sub(/^ */,""); m=split($0,a,"/"); base=a[m]; if (base ~ /^(launchd|com\.apple|WindowServer|loginwindow|distnoted|cfprefsd|mds|coreaudiod|Dock|SystemUIServer|xpcproxy|nsurlsessiond|trustd|secd|sharingd|CommCenter|MTLCompilerService|softwareupdated)$/) next; if (base ~ /Helper$/ || base ~ /XPC/ || base ~ /ExtensionService/) next; if (length(base) < 2) next; print base; }'
+    ps -axo user=,comm= 2>/dev/null | awk -v u="$cu" '$1==u {
+      $1=""; sub(/^ */,"");
+      if ($0 !~ /\.app\//) next;
+      n=split($0,a,"/");
+      for(i=1;i<=n;i++) if(a[i] ~ /\.app$/){ app=a[i]; sub(/\.app$/,"",app); break; }
+      if (app=="" || app ~ /^(Dock|Finder|SystemUIServer|ControlCenter|NotificationCenter)$/) next;
+      if (app ~ /(Helper|Agent|Daemon|Service)$/) next;
+      print app; app="";
+    }'
   } | awk 'NF && !seen[$0]++ {print}'
 }
 
@@ -324,7 +331,7 @@ build_apps_body() {
   day=$(date -u +%Y-%m-%d)
   names=$(for f in "$APPS_STATE_DIR/$day.active."* "$APPS_STATE_DIR/$day.open."*; do [ -e "$f" ] || continue; b=$(basename "$f"); pa="$day.active."; po="$day.open."; case "$b" in "$pa"*) printf '%s\n' "${b#$pa}" ;; "$po"*) printf '%s\n' "${b#$po}" ;; esac; done | sort -u)
   [ -z "$names" ] && return 1
-  printf '{"date":"%s","apps":[' "$day"
+  printf '{"date":"%s","mode":"delta","apps":[' "$day"
   first=1
   for n in $names; do
     active=0; open=0; fs=""; ls_=""
@@ -334,7 +341,7 @@ build_apps_body() {
     for k in active open; do f="$APPS_STATE_DIR/$day.first.$k.$n"; [ -f "$f" ] && { fs=$(cat "$f" 2>/dev/null); break; }; done
     for k in active open; do l="$APPS_STATE_DIR/$day.last.$k.$n"; [ -f "$l" ] && ls_=$(cat "$l" 2>/dev/null); done
     [ "$first" = "1" ] || printf ','; first=0
-    printf '{"key":"%s","label":"%s","seconds_active":%s,"seconds_open":%s,"first_seen":"%s","last_seen":"%s"}' "$(json_escape "$n")" "$(json_escape "$label")" "${active:-0}" "${open:-0}" "$(json_escape "$fs")" "$(json_escape "$ls_")"
+    printf '{"key":"%s","label":"%s","source":"gui","seconds_active":%s,"seconds_open":%s,"first_seen":"%s","last_seen":"%s"}' "$(json_escape "$n")" "$(json_escape "$label")" "${active:-0}" "${open:-0}" "$(json_escape "$fs")" "$(json_escape "$ls_")"
   done
   printf ']}'
 }
