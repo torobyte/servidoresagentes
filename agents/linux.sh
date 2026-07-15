@@ -264,11 +264,19 @@ collect() {
     done | paste -sd ',' -)
   [ -n "$mac_addr" ] || mac_addr=""
 
+  sys_vendor=$(cat /sys/devices/virtual/dmi/id/sys_vendor 2>/dev/null | tr -d '\n')
+  sys_product=$(cat /sys/devices/virtual/dmi/id/product_name 2>/dev/null | tr -d '\n')
+  sys_serial=$(cat /sys/devices/virtual/dmi/id/product_serial 2>/dev/null | tr -d '\n')
+  [ -n "$sys_serial" ] || sys_serial=$(cat /sys/devices/virtual/dmi/id/board_serial 2>/dev/null | tr -d '\n')
+  case "$sys_serial" in "To Be Filled By O.E.M."|"System Serial Number"|"None"|"Default string") sys_serial="" ;; esac
+  case "$sys_vendor"  in "To Be Filled By O.E.M."|"System manufacturer"|"None"|"Default string") sys_vendor="" ;; esac
+  case "$sys_product" in "To Be Filled By O.E.M."|"System Product Name"|"None"|"Default string") sys_product="" ;; esac
+
   latency_ms=$(ping -c 1 -W 1 1.1.1.1 2>/dev/null | awk -F'time=' '/time=/{split($2,t," "); printf "%d", t[1]+0.5; exit}')
   case "$latency_ms" in ''|*[!0-9]*) latency_ms=0 ;; esac
 
   cat <<EOF
-{"hostname":"$(json_escape "$hostname_v")","os":"$(json_escape "$os_name")","kernel":"$(json_escape "$kernel")","arch":"$(json_escape "$arch")","cores":$cores,"cpu_model":"$(json_escape "$cpu_model")","total_ram":"$(json_escape "$total_ram")","total_disk":"$(json_escape "$total_disk")","public_ip":"$(json_escape "$pub_ip")","private_ip":"$(json_escape "$priv_ip")","uptime":"$(json_escape "$uptime_v")","cpu":$cpu,"cpu_cores":$cpu_cores_arr,"ram":$ram,"disk":$disk,"network_in":$net_in,"network_out":$net_out,"load_avg":{"1":$l1,"5":$l5,"15":$l15},"gpu":"$(json_escape "$gpu")","motherboard":"$(json_escape "$motherboard")","mac_address":"$(json_escape "$mac_addr")","latency_ms":$latency_ms,"agent_version":"$AGENT_VERSION"}
+{"hostname":"$(json_escape "$hostname_v")","os":"$(json_escape "$os_name")","kernel":"$(json_escape "$kernel")","arch":"$(json_escape "$arch")","cores":$cores,"cpu_model":"$(json_escape "$cpu_model")","total_ram":"$(json_escape "$total_ram")","total_disk":"$(json_escape "$total_disk")","public_ip":"$(json_escape "$pub_ip")","private_ip":"$(json_escape "$priv_ip")","uptime":"$(json_escape "$uptime_v")","cpu":$cpu,"cpu_cores":$cpu_cores_arr,"ram":$ram,"disk":$disk,"network_in":$net_in,"network_out":$net_out,"load_avg":{"1":$l1,"5":$l5,"15":$l15},"gpu":"$(json_escape "$gpu")","motherboard":"$(json_escape "$motherboard")","mac_address":"$(json_escape "$mac_addr")","manufacturer":"$(json_escape "$sys_vendor")","hw_model":"$(json_escape "$sys_product")","serial_number":"$(json_escape "$sys_serial")","latency_ms":$latency_ms,"agent_version":"$AGENT_VERSION"}
 EOF
 }
 
