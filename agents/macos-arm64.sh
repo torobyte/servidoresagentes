@@ -244,8 +244,12 @@ collect() {
   mac_addr=$(ifconfig 2>/dev/null | awk '/^[a-z]/{iface=$1; sub(":","",iface)} /ether/{if(iface!="lo0") printf "%s%s=%s", (n++?",":""), iface, $2}')
   latency_ms=$(ping -c 1 -W 1000 1.1.1.1 2>/dev/null | awk -F'time=' '/time=/{split($2,t," "); printf "%d", t[1]+0.5; exit}')
   case "$latency_ms" in ''|*[!0-9]*) latency_ms=0 ;; esac
+  hw_manuf="Apple Inc."
+  hw_model=$(sysctl -n hw.model 2>/dev/null); [ -n "$hw_model" ] || hw_model=""
+  serial_number=$(ioreg -rd1 -c IOPlatformExpertDevice 2>/dev/null | awk -F'"' '/IOPlatformSerialNumber/ {print $4; exit}')
+  [ -n "$serial_number" ] || serial_number=""
   cat <<EOF
-{"hostname":"$(json_escape "$hostname_v")","os":"$(json_escape "$os_name")","kernel":"$(json_escape "$kernel")","arch":"$(json_escape "$arch")","cores":$cores,"cpu_model":"$(json_escape "$cpu_model")","total_ram":"$(json_escape "$tram")","total_disk":"$(json_escape "$tdisk")","public_ip":"$(json_escape "$pub")","private_ip":"$(json_escape "$priv")","uptime":"$(json_escape "$up")","cpu":$cpu,"ram":$ram,"disk":$disk,"network_in":$net_in,"network_out":$net_out,"load_avg":{"1":$l1,"5":$l5,"15":$l15},"gpu":"$(json_escape "$gpu")","motherboard":"$(json_escape "$motherboard")","mac_address":"$(json_escape "$mac_addr")","latency_ms":$latency_ms,"agent_version":"$AGENT_VERSION"}
+{"hostname":"$(json_escape "$hostname_v")","os":"$(json_escape "$os_name")","kernel":"$(json_escape "$kernel")","arch":"$(json_escape "$arch")","cores":$cores,"cpu_model":"$(json_escape "$cpu_model")","total_ram":"$(json_escape "$tram")","total_disk":"$(json_escape "$tdisk")","public_ip":"$(json_escape "$pub")","private_ip":"$(json_escape "$priv")","uptime":"$(json_escape "$up")","cpu":$cpu,"ram":$ram,"disk":$disk,"network_in":$net_in,"network_out":$net_out,"load_avg":{"1":$l1,"5":$l5,"15":$l15},"gpu":"$(json_escape "$gpu")","motherboard":"$(json_escape "$motherboard")","mac_address":"$(json_escape "$mac_addr")","manufacturer":"$(json_escape "$hw_manuf")","hw_model":"$(json_escape "$hw_model")","serial_number":"$(json_escape "$serial_number")","latency_ms":$latency_ms,"agent_version":"$AGENT_VERSION"}
 EOF
 }
 
