@@ -7,7 +7,7 @@ AGENT_TOKEN="${AGENT_TOKEN:-${TOKEN:-}}"
 INGEST_URL="${INGEST_URL:-${URL:-}}"
 INTERVAL="${INTERVAL:-5}"
 ONCE="${ONCE:-0}"
-AGENT_VERSION="2.0.3-macos-arm64"
+AGENT_VERSION="2.0.4-macos-arm64"
 MODE="${1:-run}"
 
 INSTALL_DIR="/usr/local/torobyte-agent"
@@ -231,7 +231,25 @@ collect() {
   cores=$(safe_int "$(sysctl -n hw.logicalcpu 2>/dev/null)"); [ "$cores" -gt 0 ] || cores=1
   cpu_model=$(sysctl -n machdep.cpu.brand_string 2>/dev/null); [ -n "$cpu_model" ] || cpu_model="Apple Silicon"
   prod=$(sw_vers -productName 2>/dev/null); ver=$(sw_vers -productVersion 2>/dev/null)
-  os_name="${prod:-macOS} ${ver:-}"
+  major=$(printf '%s' "$ver" | awk -F. '{print $1}')
+  minor=$(printf '%s' "$ver" | awk -F. '{print $2}')
+  case "$major" in
+    26) name="Tahoe" ;;
+    15) name="Sequoia" ;;
+    14) name="Sonoma" ;;
+    13) name="Ventura" ;;
+    12) name="Monterey" ;;
+    11) name="Big Sur" ;;
+    10)
+      case "$minor" in
+        15) name="Catalina" ;; 14) name="Mojave" ;; 13) name="High Sierra" ;;
+        12) name="Sierra" ;; 11) name="El Capitan" ;; 10) name="Yosemite" ;;
+        9) name="Mavericks" ;; 8) name="Mountain Lion" ;; 7) name="Lion" ;;
+        6) name="Snow Leopard" ;; *) name="" ;;
+      esac ;;
+    *) name="" ;;
+  esac
+  if [ -n "$name" ]; then os_name="${prod:-macOS} ${name} ${ver:-}"; else os_name="${prod:-macOS} ${ver:-}"; fi
   tram=$(total_ram); priv=$(private_ip); pub=$(public_ip); up=$(uptime_human)
   cpu=$(safe_number "$(cpu_usage)"); ram=$(safe_number "$(ram_usage)")
   disk=$(safe_number "$(disk_root)"); tdisk=$(total_disk); [ -n "$tdisk" ] || tdisk="0 GB"
