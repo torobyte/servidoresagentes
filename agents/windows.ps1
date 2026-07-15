@@ -26,7 +26,9 @@ $ScriptPath   = Join-Path $InstallDir 'torobyte-agent.ps1'
 $LogPath      = Join-Path $InstallDir 'agent.log'
 $TaskName     = 'TorobyteAgent'
 $SessionsTaskName = 'TorobyteAgentSessions'
+$ShutdownTaskName = 'TorobyteAgentShutdown'
 $SessionsCmdPath  = Join-Path $InstallDir 'torobyte-sessions.cmd'
+$ShutdownCmdPath  = Join-Path $InstallDir 'torobyte-shutdown.cmd'
 
 function W-Log($msg) {
   $line = "[$((Get-Date).ToString('o'))] $msg"
@@ -339,6 +341,20 @@ function Collect-Metrics {
     }
   } catch { $latencyMs = 0 }
 
+  $manufacturer = ''
+  $hwModel = ''
+  try {
+    if ($cs) {
+      if ($cs.Manufacturer) { $manufacturer = ($cs.Manufacturer -replace '\s+', ' ').Trim() }
+      if ($cs.Model)        { $hwModel      = ($cs.Model        -replace '\s+', ' ').Trim() }
+    }
+  } catch {}
+  $serialNumber = ''
+  try {
+    $bios = Get-CimInstance Win32_BIOS -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($bios -and $bios.SerialNumber) { $serialNumber = ($bios.SerialNumber -replace '\s+', ' ').Trim() }
+  } catch {}
+
   [pscustomobject]@{
     hostname      = $env:COMPUTERNAME
     os            = $os.Caption
@@ -361,6 +377,9 @@ function Collect-Metrics {
     gpu           = $gpuStr
     motherboard   = $mbStr
     mac_address   = $macStr
+    manufacturer  = $manufacturer
+    hw_model      = $hwModel
+    serial_number = $serialNumber
     latency_ms    = [int]$latencyMs
     agent_version = $AgentVersion
   }
@@ -1018,6 +1037,56 @@ function Install-Agent {
   Set-Content -Encoding ASCII -Path $SessionsCmdPath -Value $cmdLines
   & schtasks.exe /Create /TN $SessionsTaskName /SC ONLOGON /RL LIMITED /F /TR $SessionsCmdPath | Out-Null
   if ($LASTEXITCODE -ne 0) { W-Log 'aviso: no se pudo crear la tarea de sesiones por-usuario (metricas de apps deshabilitadas)' }
+
+  # Tarea de apagado: notifica offline al instante cuando el equipo se apaga o reinicia.
+  # Trigger = Event ID 1074 (User32) que Windows escribe apenas se inicia el shutdown.
+  & schtasks.exe /Delete /TN $ShutdownTaskName /F 2>$null | Out-Null
+  $shutdownUrl = $Url -replace '/api/public/ingest/metrics.*$', '/api/public/ingest/shutdown'
+  $curlCmd = 'curl.exe -k -sS --max-time 5 -X POST -H "Authorization: Bearer %AGENT_TOKEN%" -H "Content-Length: 0" "' + $shutdownUrl + '"'
+  $psFallback = 'powershell.exe -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -Command "try { Invoke-WebRequest -UseBasicParsing -Method Post -TimeoutSec 5 -Uri ''' + $shutdownUrl + ''' -Headers @{Authorization=(''Bearer '' + $env:AGENT_TOKEN)} | Out-Null } catch {}"'
+  $shutdownLines = @('@echo off', $curlCmd, 'if errorlevel 1 ' + $psFallback)
+  Set-Content -Encoding ASCII -Path $ShutdownCmdPath -Value $shutdownLines
+  $shutdownXml = @"
+<?xml version="1.0" encoding="UTF-16"?>
+<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <Triggers>
+    <EventTrigger>
+      <Enabled>true</Enabled>
+      <Subscription>&lt;QueryList&gt;&lt;Query Id="0" Path="System"&gt;&lt;Select Path="System"&gt;*[System[Provider[@Name='USER32'] and (EventID=1074)]]&lt;/Select&gt;&lt;/Query&gt;&lt;/QueryList&gt;</Subscription>
+    </EventTrigger>
+  </Triggers>
+  <Principals>
+    <Principal id="Author">
+      <UserId>S-1-5-18</UserId>
+      <RunLevel>HighestAvailable</RunLevel>
+    </Principal>
+  </Principals>
+  <Settings>
+    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
+    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
+    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
+    <AllowHardTerminate>true</AllowHardTerminate>
+    <StartWhenAvailable>false</StartWhenAvailable>
+    <RunOnlyIfNetworkAvailable>false</RunOnlyIfNetworkAvailable>
+    <IdleSettings><StopOnIdleEnd>true</StopOnIdleEnd><RestartOnIdle>false</RestartOnIdle></IdleSettings>
+    <AllowStartOnDemand>true</AllowStartOnDemand>
+    <Enabled>true</Enabled>
+    <Hidden>false</Hidden>
+    <ExecutionTimeLimit>PT1M</ExecutionTimeLimit>
+    <Priority>4</Priority>
+  </Settings>
+  <Actions Context="Author">
+    <Exec>
+      <Command>cmd.exe</Command>
+      <Arguments>/c "$ShutdownCmdPath"</Arguments>
+    </Exec>
+  </Actions>
+</Task>
+"@
+  $shutdownXmlPath = Join-Path $InstallDir 'shutdown-task.xml'
+  Set-Content -Encoding Unicode -Path $shutdownXmlPath -Value $shutdownXml
+  & schtasks.exe /Create /TN $ShutdownTaskName /XML $shutdownXmlPath /F | Out-Null
+  if ($LASTEXITCODE -ne 0) { W-Log 'aviso: no se pudo crear la tarea de apagado (offline instantaneo deshabilitado)' }
   W-Ok 'tareas creadas'
 
   W-Step 7 $total 'Iniciando agente en background...'
@@ -1047,6 +1116,8 @@ function Uninstall-Agent {
   & schtasks.exe /Delete /TN $TaskName /F 2>$null | Out-Null
   & schtasks.exe /End /TN $SessionsTaskName 2>$null | Out-Null
   & schtasks.exe /Delete /TN $SessionsTaskName /F 2>$null | Out-Null
+  & schtasks.exe /End /TN $ShutdownTaskName 2>$null | Out-Null
+  & schtasks.exe /Delete /TN $ShutdownTaskName /F 2>$null | Out-Null
   W-Ok 'tareas programadas eliminadas'
   Get-Process powershell -ErrorAction SilentlyContinue | Where-Object {
     try { $_.CommandLine -match 'torobyte-agent.ps1' } catch { $false }
