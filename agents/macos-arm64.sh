@@ -7,7 +7,7 @@ AGENT_TOKEN="${AGENT_TOKEN:-${TOKEN:-}}"
 INGEST_URL="${INGEST_URL:-${URL:-}}"
 INTERVAL="${INTERVAL:-5}"
 ONCE="${ONCE:-0}"
-AGENT_VERSION="2.0.2-macos-arm64"
+AGENT_VERSION="2.0.3-macos-arm64"
 MODE="${1:-run}"
 
 INSTALL_DIR="/usr/local/torobyte-agent"
