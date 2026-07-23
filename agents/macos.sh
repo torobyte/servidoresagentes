@@ -478,6 +478,7 @@ DISKS_URL=$(derive_ingest_url disks)
 SERVICES_URL=$(derive_ingest_url services)
 APPS_URL=$(derive_ingest_url apps)
 SESSIONS_URL=$(derive_ingest_url sessions)
+WEBS_URL=$(derive_ingest_url websites)
 
 # -------------------------- Aplicaciones (uso) --------------------------
 APPS_STATE_DIR="${TMPDIR:-/tmp}/torobyte-apps"
@@ -632,6 +633,138 @@ send_apps() {
   # Reset counters tras envío exitoso (dejamos first/last del día)
   day=$(date -u +%Y-%m-%d)
   rm -f "$APPS_STATE_DIR/$day.active."* "$APPS_STATE_DIR/$day.open."* 2>/dev/null || true
+}
+
+# ---------------------- Sitios web visitados (dominio de la pestaña activa) --------------
+WEBS_STATE_DIR="${TMPDIR:-/tmp}/torobyte-webs"
+mkdir -p "$WEBS_STATE_DIR" 2>/dev/null || true
+WEBS_LAST_SAMPLE_FILE="$WEBS_STATE_DIR/last-sample"
+
+web_sample_delta() {
+  now=$(date +%s)
+  last=0; [ -f "$WEBS_LAST_SAMPLE_FILE" ] && last=$(cat "$WEBS_LAST_SAMPLE_FILE" 2>/dev/null | tr -cd 0-9)
+  echo "$now" > "$WEBS_LAST_SAMPLE_FILE" 2>/dev/null || true
+  if [ -z "$last" ] || [ "$last" -le 0 ]; then delta="${INTERVAL:-5}"; else delta=$((now - last)); fi
+  [ "$delta" -lt 1 ] && delta=1
+  [ "$delta" -gt 300 ] && delta=300
+  printf '%s' "$delta"
+}
+
+# Devuelve "browser|url" del navegador en foreground (si aplica), usando AppleScript.
+foreground_browser_url() {
+  cu=$(console_user)
+  [ -n "$cu" ] && [ "$cu" != "root" ] || return 0
+  uid=$(id -u "$cu" 2>/dev/null || echo "")
+  [ -n "$uid" ] || return 0
+  command -v launchctl >/dev/null 2>&1 || return 0
+  command -v osascript >/dev/null 2>&1 || return 0
+  fg=$(launchctl asuser "$uid" sudo -u "$cu" osascript -e 'tell application "System Events" to name of first application process whose frontmost is true' 2>/dev/null | tr -d '\n')
+  [ -n "$fg" ] || return 0
+  url=""
+  browser=""
+  case "$fg" in
+    "Google Chrome"|"Google Chrome Canary"|"Chromium")
+      browser=$(printf '%s' "$fg" | tr 'A-Z ' 'a-z_')
+      url=$(launchctl asuser "$uid" sudo -u "$cu" osascript -e "tell application \"$fg\" to get URL of active tab of front window" 2>/dev/null | tr -d '\n')
+      ;;
+    "Brave Browser"|"Brave Browser Beta")
+      browser="brave"
+      url=$(launchctl asuser "$uid" sudo -u "$cu" osascript -e "tell application \"$fg\" to get URL of active tab of front window" 2>/dev/null | tr -d '\n')
+      ;;
+    "Microsoft Edge"|"Microsoft Edge Beta"|"Microsoft Edge Dev")
+      browser="msedge"
+      url=$(launchctl asuser "$uid" sudo -u "$cu" osascript -e "tell application \"$fg\" to get URL of active tab of front window" 2>/dev/null | tr -d '\n')
+      ;;
+    "Vivaldi"|"Opera"|"Arc")
+      browser=$(printf '%s' "$fg" | tr 'A-Z ' 'a-z_')
+      url=$(launchctl asuser "$uid" sudo -u "$cu" osascript -e "tell application \"$fg\" to get URL of active tab of front window" 2>/dev/null | tr -d '\n')
+      ;;
+    "Safari"|"Safari Technology Preview")
+      browser="safari"
+      url=$(launchctl asuser "$uid" sudo -u "$cu" osascript -e "tell application \"$fg\" to get URL of front document" 2>/dev/null | tr -d '\n')
+      ;;
+    "Firefox"|"Waterfox"|"LibreWolf")
+      # Firefox no expone URL vía AppleScript; usamos el título de la ventana.
+      browser=$(printf '%s' "$fg" | tr 'A-Z ' 'a-z_')
+      title=$(launchctl asuser "$uid" sudo -u "$cu" osascript -e "tell application \"System Events\" to tell (first process whose frontmost is true) to try
+get name of front window
+end try" 2>/dev/null | tr -d '\n')
+      url=""
+      # Extraer dominio del título directamente
+      if [ -n "$title" ]; then
+        dom=$(printf '%s' "$title" | grep -Eio '([a-z0-9](-*[a-z0-9])*\.)+[a-z]{2,24}' | head -1 | tr 'A-Z' 'a-z')
+        [ -n "$dom" ] && printf '%s|%s' "$browser" "$dom" && return 0
+      fi
+      return 0
+      ;;
+    *) return 0 ;;
+  esac
+  [ -n "$url" ] || return 0
+  # Extraer host de la URL: quitar esquema, path, puerto
+  host=$(printf '%s' "$url" | sed -E 's#^[a-zA-Z]+://##; s#/.*##; s#:[0-9]+$##' | tr 'A-Z' 'a-z')
+  # Quitar www.
+  host=$(printf '%s' "$host" | sed 's/^www\.//')
+  # Solo aceptar hosts con TLD válido
+  case "$host" in
+    *.*) ;;
+    *) return 0 ;;
+  esac
+  printf '%s|%s' "$browser" "$host"
+}
+
+web_touch_seen() {
+  day="$1"; domain="$2"; browser="$3"; nowiso="$4"
+  fs="$WEBS_STATE_DIR/$day.first.$domain"
+  ls_="$WEBS_STATE_DIR/$day.last.$domain"
+  br="$WEBS_STATE_DIR/$day.browser.$domain"
+  [ -f "$fs" ] || echo "$nowiso" > "$fs"
+  echo "$nowiso" > "$ls_"
+  [ -f "$br" ] || printf '%s' "$browser" > "$br"
+}
+
+sample_websites() {
+  day=$(date -u +%Y-%m-%d)
+  nowiso=$(now_iso)
+  delta=$(web_sample_delta)
+  info=$(foreground_browser_url 2>/dev/null || true)
+  [ -n "$info" ] || return 0
+  browser=$(printf '%s' "$info" | cut -d'|' -f1)
+  domain=$(printf '%s' "$info" | cut -d'|' -f2)
+  [ -n "$domain" ] || return 0
+  safe=$(printf '%s' "$domain" | tr -c 'a-z0-9.-' '_' | cut -c1-100)
+  [ -n "$safe" ] || return 0
+  bump "$WEBS_STATE_DIR/$day.active.$safe" "$delta"
+  web_touch_seen "$day" "$safe" "$browser" "$nowiso"
+}
+
+build_websites_body() {
+  day=$(date -u +%Y-%m-%d)
+  names=$(for f in "$WEBS_STATE_DIR/$day.active."*; do
+    [ -e "$f" ] || continue
+    b=$(basename "$f"); printf '%s\n' "$b" | sed "s/^$day\.active\.//"
+  done | sort -u)
+  [ -z "$names" ] && return 1
+  printf '{"date":"%s","mode":"delta","websites":[' "$day"
+  first=1
+  for n in $names; do
+    active=0; fs=""; ls_=""; br=""
+    [ -f "$WEBS_STATE_DIR/$day.active.$n" ] && active=$(cat "$WEBS_STATE_DIR/$day.active.$n" 2>/dev/null | tr -cd 0-9)
+    [ -f "$WEBS_STATE_DIR/$day.first.$n" ] && fs=$(cat "$WEBS_STATE_DIR/$day.first.$n" 2>/dev/null)
+    [ -f "$WEBS_STATE_DIR/$day.last.$n" ] && ls_=$(cat "$WEBS_STATE_DIR/$day.last.$n" 2>/dev/null)
+    [ -f "$WEBS_STATE_DIR/$day.browser.$n" ] && br=$(cat "$WEBS_STATE_DIR/$day.browser.$n" 2>/dev/null)
+    [ "$first" = "1" ] || printf ','
+    first=0
+    printf '{"domain":"%s","browser":"%s","seconds_active":%s,"first_seen":"%s","last_seen":"%s"}' \
+      "$(json_escape "$n")" "$(json_escape "$br")" "${active:-0}" "$(json_escape "$fs")" "$(json_escape "$ls_")"
+  done
+  printf ']}'
+}
+
+send_websites() {
+  BODY=$(build_websites_body) || return 0
+  post_json "$WEBS_URL" "$BODY" >/dev/null 2>&1 || return 0
+  day=$(date -u +%Y-%m-%d)
+  rm -f "$WEBS_STATE_DIR/$day.active."* 2>/dev/null || true
 }
 
 # -------------- Sesiones foreground v2.0.0 (idempotentes por UUID) --------------
@@ -862,6 +995,12 @@ while true; do
     send_apps 2>/dev/null || true
     APPS_LOOP=0
   fi
+
+  # Sitios web visitados (dominio del navegador en foreground)
+  sample_websites 2>/dev/null || true
+  send_websites 2>/dev/null || true
+
+
 
   # Sesiones foreground v2.0.0: sub-muestreo dentro del intervalo
   SLEPT=0
