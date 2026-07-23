@@ -629,6 +629,85 @@ function Reset-AppCounters {
   $Script:_appOpen = @{}
 }
 
+# ---------------------- Sitios web visitados (dominio de la pestana activa) --------------
+$Script:_webActive = @{}
+$Script:_webBrowser = @{}
+$Script:_webFirst = @{}
+$Script:_webLast = @{}
+$Script:_browserProcNames = @('chrome','msedge','firefox','brave','opera','vivaldi','iexplore','arc','waterfox','librewolf','msedgewebview2','operagx')
+
+function Test-BrowserProc([string]$name) {
+  if (-not $name) { return $false }
+  $lower = $name.ToLowerInvariant()
+  foreach ($b in $Script:_browserProcNames) { if ($lower -eq $b) { return $true } }
+  return $false
+}
+
+function Extract-DomainFromTitle([string]$title) {
+  if (-not $title) { return $null }
+  # Quitar sufijos tipicos " - Google Chrome" / " — Mozilla Firefox" / " - Microsoft Edge" etc.
+  $clean = $title -replace '\s+[\-\u2014\u2013\u2015\|]\s+(Google Chrome|Chromium|Mozilla Firefox|Microsoft.? Edge|Brave|Vivaldi|Opera( GX)?|Arc|Waterfox|LibreWolf|Internet Explorer)(\s+\(.*\))?$', ''
+  # Buscar patron de dominio dentro del titulo
+  $m = [regex]::Match($clean, '(?i)\b((?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.)+(?:[a-z]{2,24}))\b')
+  if ($m.Success) {
+    $d = $m.Value.ToLowerInvariant()
+    if ($d.StartsWith('www.')) { $d = $d.Substring(4) }
+    return $d
+  }
+  return $null
+}
+
+function Get-ForegroundDomain {
+  try {
+    $hwnd = [ToroForegroundWin]::GetForegroundWindow()
+    if ($hwnd -eq [IntPtr]::Zero) { return $null }
+    $procId = 0
+    [void][ToroForegroundWin]::GetWindowThreadProcessId($hwnd, [ref]$procId)
+    if ($procId -le 0) { return $null }
+    $p = Get-Process -Id $procId -ErrorAction SilentlyContinue
+    if (-not $p) { return $null }
+    if (-not (Test-BrowserProc $p.ProcessName)) { return $null }
+    $sb = New-Object System.Text.StringBuilder 512
+    [void][ToroForegroundWin]::GetWindowText($hwnd, $sb, 512)
+    $title = $sb.ToString()
+    $domain = Extract-DomainFromTitle $title
+    if (-not $domain) { return $null }
+    return @{ domain = $domain; browser = $p.ProcessName.ToLowerInvariant() }
+  } catch {}
+  return $null
+}
+
+function Add-WebSeconds([string]$domain, [string]$browser, [int]$seconds) {
+  if (-not $domain -or $seconds -le 0) { return }
+  if (-not $Script:_webActive.ContainsKey($domain)) { $Script:_webActive[$domain] = 0 }
+  $Script:_webActive[$domain] = [int]$Script:_webActive[$domain] + $seconds
+  if ($browser -and -not $Script:_webBrowser.ContainsKey($domain)) { $Script:_webBrowser[$domain] = $browser }
+  $nowIso = (Get-Date).ToUniversalTime().ToString('o')
+  if (-not $Script:_webFirst.ContainsKey($domain)) { $Script:_webFirst[$domain] = $nowIso }
+  $Script:_webLast[$domain] = $nowIso
+}
+
+function Sample-Websites([int]$seconds) {
+  $info = Get-ForegroundDomain
+  if ($info) { Add-WebSeconds $info.domain $info.browser $seconds }
+}
+
+function Build-WebsitesPayload {
+  $sites = @()
+  foreach ($k in @($Script:_webActive.Keys)) {
+    $sites += [pscustomobject]@{
+      domain = $k
+      browser = if ($Script:_webBrowser.ContainsKey($k)) { $Script:_webBrowser[$k] } else { $null }
+      seconds_active = [int]$Script:_webActive[$k]
+      first_seen = if ($Script:_webFirst.ContainsKey($k)) { $Script:_webFirst[$k] } else { $null }
+      last_seen  = if ($Script:_webLast.ContainsKey($k)) { $Script:_webLast[$k] } else { $null }
+    }
+  }
+  return @{ date = (Get-Date).ToUniversalTime().ToString('yyyy-MM-dd'); mode = 'delta'; websites = $sites }
+}
+
+function Reset-WebCounters { $Script:_webActive = @{} }
+
 # ------------- Foreground sessions v2 (idempotentes por UUID) --------------
 function New-SessionUuid { return [guid]::NewGuid().ToString().ToLowerInvariant() }
 function Iso-Now { return (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ss.fffZ") }
@@ -922,6 +1001,7 @@ function Run-AgentLoop {
   $diskUrl = Get-IngestEndpoint 'disks'
   $svcUrl  = Get-IngestEndpoint 'services'
   $appsUrl = Get-IngestEndpoint 'apps'
+  $websUrl = Get-IngestEndpoint 'websites'
   $sessionsUrl = Get-IngestEndpoint 'sessions'
 
   W-Log "torobyte-agent $AgentVersion started interval=$Interval endpoint=$Url"
@@ -959,7 +1039,15 @@ function Run-AgentLoop {
       }
       $Script:_appLastSampleAt = $sampleNow
       Sample-Apps $sampleDelta
+      Sample-Websites $sampleDelta
       Post-Json $appsUrl (Build-AppsPayload) | Out-Null
+      try {
+        $wPayload = Build-WebsitesPayload
+        if ($wPayload.websites.Count -gt 0) {
+          Post-Json $websUrl $wPayload | Out-Null
+          Reset-WebCounters
+        }
+      } catch { W-Log "web post error: $($_.Exception.Message)" }
       Reset-AppCounters
 
       # Sesiones foreground v2: muestreo fino durante el sleep
@@ -1026,16 +1114,92 @@ function Install-Agent {
   [Environment]::SetEnvironmentVariable('INGEST_URL',  $Url,      'Machine')
   [Environment]::SetEnvironmentVariable('INTERVAL',    "$Interval",'Machine')
   [Environment]::SetEnvironmentVariable('MODE',        'run',     'Machine')
-  $action = 'powershell.exe -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File "' + $ScriptPath + '"'
-  & schtasks.exe /Create /TN $TaskName /SC ONSTART /RL HIGHEST /RU SYSTEM /F /TR $action | Out-Null
+  # ONSTART task (SYSTEM) - se registra con XML para eliminar el limite por defecto
+  # de 72h (ExecutionTimeLimit=PT0S) y activar reintentos automaticos si falla.
+  $agentXml = @"
+<?xml version="1.0" encoding="UTF-16"?>
+<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <Triggers>
+    <BootTrigger><Enabled>true</Enabled></BootTrigger>
+  </Triggers>
+  <Principals>
+    <Principal id="Author">
+      <UserId>S-1-5-18</UserId>
+      <RunLevel>HighestAvailable</RunLevel>
+    </Principal>
+  </Principals>
+  <Settings>
+    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
+    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
+    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
+    <AllowHardTerminate>false</AllowHardTerminate>
+    <StartWhenAvailable>true</StartWhenAvailable>
+    <RunOnlyIfNetworkAvailable>false</RunOnlyIfNetworkAvailable>
+    <IdleSettings><StopOnIdleEnd>false</StopOnIdleEnd><RestartOnIdle>false</RestartOnIdle></IdleSettings>
+    <AllowStartOnDemand>true</AllowStartOnDemand>
+    <Enabled>true</Enabled>
+    <Hidden>false</Hidden>
+    <RestartOnFailure><Interval>PT1M</Interval><Count>999</Count></RestartOnFailure>
+    <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>
+    <Priority>5</Priority>
+  </Settings>
+  <Actions Context="Author">
+    <Exec>
+      <Command>powershell.exe</Command>
+      <Arguments>-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File "$ScriptPath"</Arguments>
+    </Exec>
+  </Actions>
+</Task>
+"@
+  $agentXmlPath = Join-Path $InstallDir 'agent-task.xml'
+  Set-Content -Encoding Unicode -Path $agentXmlPath -Value $agentXml
+  & schtasks.exe /Create /TN $TaskName /XML $agentXmlPath /F | Out-Null
   if ($LASTEXITCODE -ne 0) { W-Fail 'no se pudo crear la tarea programada del sistema' }
 
   # Tarea por-usuario (ONLOGON) para capturar la aplicacion en primer plano.
   # SYSTEM esta en Session 0 y no puede ver el escritorio interactivo, por eso
   # se requiere una tarea separada que corra como el usuario que inicia sesion.
+  # Tambien se crea con XML para eliminar el limite de 72h.
   $cmdLines = @('@echo off', 'set MODE=run-sessions', ('powershell.exe -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File "' + $ScriptPath + '"'))
   Set-Content -Encoding ASCII -Path $SessionsCmdPath -Value $cmdLines
-  & schtasks.exe /Create /TN $SessionsTaskName /SC ONLOGON /RL LIMITED /F /TR $SessionsCmdPath | Out-Null
+  $sessionsXml = @"
+<?xml version="1.0" encoding="UTF-16"?>
+<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <Triggers>
+    <LogonTrigger><Enabled>true</Enabled></LogonTrigger>
+  </Triggers>
+  <Principals>
+    <Principal id="Author">
+      <GroupId>S-1-5-32-545</GroupId>
+      <RunLevel>LeastPrivilege</RunLevel>
+    </Principal>
+  </Principals>
+  <Settings>
+    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
+    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
+    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
+    <AllowHardTerminate>false</AllowHardTerminate>
+    <StartWhenAvailable>true</StartWhenAvailable>
+    <RunOnlyIfNetworkAvailable>false</RunOnlyIfNetworkAvailable>
+    <IdleSettings><StopOnIdleEnd>false</StopOnIdleEnd><RestartOnIdle>false</RestartOnIdle></IdleSettings>
+    <AllowStartOnDemand>true</AllowStartOnDemand>
+    <Enabled>true</Enabled>
+    <Hidden>false</Hidden>
+    <RestartOnFailure><Interval>PT1M</Interval><Count>999</Count></RestartOnFailure>
+    <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>
+    <Priority>7</Priority>
+  </Settings>
+  <Actions Context="Author">
+    <Exec>
+      <Command>cmd.exe</Command>
+      <Arguments>/c "$SessionsCmdPath"</Arguments>
+    </Exec>
+  </Actions>
+</Task>
+"@
+  $sessionsXmlPath = Join-Path $InstallDir 'sessions-task.xml'
+  Set-Content -Encoding Unicode -Path $sessionsXmlPath -Value $sessionsXml
+  & schtasks.exe /Create /TN $SessionsTaskName /XML $sessionsXmlPath /F | Out-Null
   if ($LASTEXITCODE -ne 0) { W-Log 'aviso: no se pudo crear la tarea de sesiones por-usuario (metricas de apps deshabilitadas)' }
 
   # Tarea de apagado: notifica offline al instante cuando el equipo se apaga o reinicia.
