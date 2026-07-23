@@ -14,7 +14,7 @@ $p=0;'Ssl3','Tls','Tls11','Tls12','Tls13'|%{try{$p=$p-bor[Net.SecurityProtocolTy
 try { [Net.ServicePointManager]::ServerCertificateValidationCallback = { $true } } catch {}
 $ErrorActionPreference = 'Continue'
 
-$AgentVersion = '2.0.5-windows'
+$AgentVersion = '2.0.7-windows'
 $Token        = if ($env:AGENT_TOKEN) { $env:AGENT_TOKEN } else { $env:TOKEN }
 $Url          = if ($env:INGEST_URL)  { $env:INGEST_URL }  else { $env:URL }
 $Interval     = if ($env:INTERVAL)    { [int]$env:INTERVAL } else { 5 }
@@ -537,6 +537,13 @@ public class ToroForegroundWin {
 "@ -ErrorAction SilentlyContinue
 } catch {}
 
+$Script:_uiAutomationReady = $false
+try {
+  Add-Type -AssemblyName UIAutomationClient -ErrorAction Stop
+  Add-Type -AssemblyName UIAutomationTypes -ErrorAction Stop
+  $Script:_uiAutomationReady = $true
+} catch {}
+
 function Normalize-AppKey($name) {
   $s = ("$name").ToLowerInvariant() -replace '[^a-z0-9._-]', '_'
   if ($s.Length -gt 60) { $s = $s.Substring(0, 60) }
@@ -634,13 +641,134 @@ $Script:_webActive = @{}
 $Script:_webBrowser = @{}
 $Script:_webFirst = @{}
 $Script:_webLast = @{}
-$Script:_browserProcNames = @('chrome','msedge','firefox','brave','opera','vivaldi','iexplore','arc','waterfox','librewolf','msedgewebview2','operagx')
+$Script:_browserProcNames = @('chrome','msedge','firefox','brave','opera','vivaldi','iexplore','arc','waterfox','librewolf','msedgewebview2','operagx','tor','torbrowser','yandex','browser','palemoon','floorp','thorium','ucbrowser','maxthon','slimjet','centbrowser','epicprivacybrowser','duckduckgo','samsung','safari','chromium','ungoogled-chromium','iron','srware')
+
+# ---------------- Persistencia local de contadores (anti-perdida) --------
+$Script:_stateFile = Join-Path $InstallDir 'agent-state.json'
+
+function ConvertTo-Hash($psobj) {
+  $h = @{}
+  if ($null -eq $psobj) { return $h }
+  if ($psobj -is [hashtable]) { return $psobj }
+  try { foreach ($p in $psobj.PSObject.Properties) { $h[$p.Name] = $p.Value } } catch {}
+  return $h
+}
+
+function Save-AgentState {
+  try {
+    $obj = @{
+      web = @{
+        active  = $Script:_webActive
+        browser = $Script:_webBrowser
+        first   = $Script:_webFirst
+        last    = $Script:_webLast
+      }
+      apps = @{
+        active = $Script:_appActive
+        open   = $Script:_appOpen
+        first  = $Script:_appFirst
+        last   = $Script:_appLast
+        labels = $Script:_appLabels
+      }
+      sessions = @{
+        queue   = @($Script:_sessionQueue)
+        idle    = @($Script:_idleQueue)
+        current = $Script:_curSession
+        curIdle = $Script:_curIdle
+      }
+      saved_at = (Get-Date).ToUniversalTime().ToString('o')
+    }
+    $json = $obj | ConvertTo-Json -Depth 10 -Compress
+    $tmp  = $Script:_stateFile + '.tmp'
+    [System.IO.File]::WriteAllText($tmp, $json, [System.Text.Encoding]::UTF8)
+    Move-Item -Force -Path $tmp -Destination $Script:_stateFile -ErrorAction SilentlyContinue
+  } catch {}
+}
+
+function Load-AgentState {
+  try {
+    if (-not (Test-Path $Script:_stateFile)) { return }
+    $raw = Get-Content -Raw -Path $Script:_stateFile -ErrorAction Stop
+    if (-not $raw) { return }
+    $obj = $raw | ConvertFrom-Json
+    if ($obj.web) {
+      $Script:_webActive  = ConvertTo-Hash $obj.web.active
+      $Script:_webBrowser = ConvertTo-Hash $obj.web.browser
+      $Script:_webFirst   = ConvertTo-Hash $obj.web.first
+      $Script:_webLast    = ConvertTo-Hash $obj.web.last
+    }
+    if ($obj.apps) {
+      $Script:_appActive = ConvertTo-Hash $obj.apps.active
+      $Script:_appOpen   = ConvertTo-Hash $obj.apps.open
+      $Script:_appFirst  = ConvertTo-Hash $obj.apps.first
+      $Script:_appLast   = ConvertTo-Hash $obj.apps.last
+      $Script:_appLabels = ConvertTo-Hash $obj.apps.labels
+    }
+    if ($obj.sessions) {
+      if ($obj.sessions.queue) { foreach ($it in @($obj.sessions.queue)) { [void]$Script:_sessionQueue.Add($it) } }
+      if ($obj.sessions.idle)  { foreach ($it in @($obj.sessions.idle))  { [void]$Script:_idleQueue.Add($it) } }
+      if ($obj.sessions.current) { $Script:_curSession = $obj.sessions.current }
+      if ($obj.sessions.curIdle) { $Script:_curIdle    = $obj.sessions.curIdle }
+    }
+    W-Log ("estado local restaurado (web={0} apps={1} sess={2} idle={3})" -f $Script:_webActive.Count, $Script:_appActive.Count, $Script:_sessionQueue.Count, $Script:_idleQueue.Count)
+  } catch { W-Log "load-state error: $($_.Exception.Message)" }
+}
 
 function Test-BrowserProc([string]$name) {
   if (-not $name) { return $false }
   $lower = $name.ToLowerInvariant()
   foreach ($b in $Script:_browserProcNames) { if ($lower -eq $b) { return $true } }
   return $false
+}
+
+function Normalize-WebDomain([string]$raw) {
+  if (-not $raw) { return $null }
+  $s = ($raw.Trim() -replace '^view-source:', '')
+  if (-not $s) { return $null }
+  try {
+    if ($s -match '^[a-z][a-z0-9+.-]*://') {
+      $u = [Uri]$s
+      if ($u.Host) {
+        $host = $u.Host.ToLowerInvariant()
+        if ($host.StartsWith('www.')) { $host = $host.Substring(4) }
+        if ($host -match '^[a-z0-9-]+(\.[a-z0-9-]+)+$') { return $host }
+      }
+    }
+  } catch {}
+  $m = [regex]::Match($s, '(?i)\b((?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.)+(?:[a-z]{2,24}))\b')
+  if ($m.Success) {
+    $d = $m.Value.ToLowerInvariant()
+    if ($d.StartsWith('www.')) { $d = $d.Substring(4) }
+    if ($d -match '^[a-z0-9-]+(\.[a-z0-9-]+)+$') { return $d }
+  }
+  return $null
+}
+
+function Get-BrowserDomainFromWindow([IntPtr]$hwnd) {
+  if (-not $Script:_uiAutomationReady) { return $null }
+  try {
+    $root = [System.Windows.Automation.AutomationElement]::FromHandle($hwnd)
+    if (-not $root) { return $null }
+    $cond = New-Object System.Windows.Automation.PropertyCondition(
+      [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
+      [System.Windows.Automation.ControlType]::Edit
+    )
+    $edits = $root.FindAll([System.Windows.Automation.TreeScope]::Descendants, $cond)
+    for ($i = 0; $i -lt $edits.Count; $i++) {
+      $el = $edits.Item($i)
+      $candidates = @()
+      try {
+        $vp = $el.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern)
+        if ($vp -and $vp.Current.Value) { $candidates += $vp.Current.Value }
+      } catch {}
+      try { if ($el.Current.Name) { $candidates += $el.Current.Name } } catch {}
+      foreach ($candidate in $candidates) {
+        $domain = Normalize-WebDomain $candidate
+        if ($domain) { return $domain }
+      }
+    }
+  } catch {}
+  return $null
 }
 
 function Extract-DomainFromTitle([string]$title) {
@@ -667,6 +795,8 @@ function Get-ForegroundDomain {
     $p = Get-Process -Id $procId -ErrorAction SilentlyContinue
     if (-not $p) { return $null }
     if (-not (Test-BrowserProc $p.ProcessName)) { return $null }
+    $domain = Get-BrowserDomainFromWindow $hwnd
+    if ($domain) { return @{ domain = $domain; browser = $p.ProcessName.ToLowerInvariant() } }
     $sb = New-Object System.Text.StringBuilder 512
     [void][ToroForegroundWin]::GetWindowText($hwnd, $sb, 512)
     $title = $sb.ToString()
@@ -1005,6 +1135,7 @@ function Run-AgentLoop {
   $sessionsUrl = Get-IngestEndpoint 'sessions'
 
   W-Log "torobyte-agent $AgentVersion started interval=$Interval endpoint=$Url"
+  Load-AgentState
   [void](Get-NetRates)
 
   while ($true) {
@@ -1040,15 +1171,16 @@ function Run-AgentLoop {
       $Script:_appLastSampleAt = $sampleNow
       Sample-Apps $sampleDelta
       Sample-Websites $sampleDelta
-      Post-Json $appsUrl (Build-AppsPayload) | Out-Null
+      Save-AgentState
+      $appsResp = Post-Json $appsUrl (Build-AppsPayload)
+      if ($appsResp) { Reset-AppCounters; Save-AgentState } else { W-Log "apps post pendiente (buffer local)" }
       try {
         $wPayload = Build-WebsitesPayload
         if ($wPayload.websites.Count -gt 0) {
-          Post-Json $websUrl $wPayload | Out-Null
-          Reset-WebCounters
+          $wResp = Post-Json $websUrl $wPayload
+          if ($wResp) { Reset-WebCounters; Save-AgentState } else { W-Log "web post pendiente (buffer local)" }
         }
       } catch { W-Log "web post error: $($_.Exception.Message)" }
-      Reset-AppCounters
 
       # Sesiones foreground v2: muestreo fino durante el sleep
       $slept = 0
@@ -1059,11 +1191,12 @@ function Run-AgentLoop {
         Start-Sleep -Seconds $step
         $slept += $step
       }
+      Save-AgentState
       try {
         $sPayload = Build-SessionsPayload
         if ($sPayload.sessions.Count -gt 0 -or $sPayload.idle_sessions.Count -gt 0) {
-          Post-Json $sessionsUrl $sPayload | Out-Null
-          Reset-SessionQueues
+          $sResp = Post-Json $sessionsUrl $sPayload
+          if ($sResp) { Reset-SessionQueues; Save-AgentState } else { W-Log "sessions post pendiente (buffer local)" }
         }
       } catch { W-Log "sessions post error: $($_.Exception.Message)" }
     } catch {
@@ -1301,22 +1434,44 @@ function Uninstall-Agent {
 
 function Run-SessionsLoop {
   if (-not $Token -or -not $Url) { W-Log 'sessions loop: token/url faltantes'; exit 1 }
+  $appsUrl = Get-IngestEndpoint 'apps'
+  $websUrl = Get-IngestEndpoint 'websites'
   $sessionsUrl = Get-IngestEndpoint 'sessions'
+  # Estado local por usuario para no perder metricas si falla el envio
+  try { $Script:_stateFile = Join-Path $InstallDir ("agent-state-{0}.json" -f ([Environment]::UserName).ToLowerInvariant()) } catch {}
   W-Log "torobyte-agent sessions loop $AgentVersion interval=$Interval user=$([Environment]::UserName)"
+  Load-AgentState
   while ($true) {
     try {
       $slept = 0
       $step = $Script:_sessionSampleSec
       while ($slept -lt $script:Interval) {
+        try { Sample-Apps $step } catch { W-Log "apps sample error: $($_.Exception.Message)" }
+        try { Sample-Websites $step } catch { W-Log "web sample error: $($_.Exception.Message)" }
         try { Sample-Session } catch { W-Log "session sample error: $($_.Exception.Message)" }
         Start-Sleep -Seconds $step
         $slept += $step
       }
+      Save-AgentState
+      try {
+        $aPayload = Build-AppsPayload
+        if ($aPayload.apps.Count -gt 0) {
+          $aResp = Post-Json $appsUrl $aPayload
+          if ($aResp) { Reset-AppCounters; Save-AgentState } else { W-Log "apps post pendiente (buffer local)" }
+        }
+      } catch { W-Log "apps post error: $($_.Exception.Message)" }
+      try {
+        $wPayload = Build-WebsitesPayload
+        if ($wPayload.websites.Count -gt 0) {
+          $wResp = Post-Json $websUrl $wPayload
+          if ($wResp) { Reset-WebCounters; Save-AgentState } else { W-Log "web post pendiente (buffer local)" }
+        }
+      } catch { W-Log "web post error: $($_.Exception.Message)" }
       try {
         $sPayload = Build-SessionsPayload
         if ($sPayload.sessions.Count -gt 0 -or $sPayload.idle_sessions.Count -gt 0) {
-          Post-Json $sessionsUrl $sPayload | Out-Null
-          Reset-SessionQueues
+          $sResp = Post-Json $sessionsUrl $sPayload
+          if ($sResp) { Reset-SessionQueues; Save-AgentState } else { W-Log "sessions post pendiente (buffer local)" }
         }
       } catch { W-Log "sessions post error: $($_.Exception.Message)" }
     } catch { W-Log "sessions loop error: $($_.Exception.Message)" }
