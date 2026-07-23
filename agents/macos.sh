@@ -14,7 +14,7 @@ AGENT_TOKEN="${AGENT_TOKEN:-${TOKEN:-}}"
 INGEST_URL="${INGEST_URL:-${URL:-}}"
 INTERVAL="${INTERVAL:-5}"
 ONCE="${ONCE:-0}"
-AGENT_VERSION="2.0.5-macos"
+AGENT_VERSION="2.0.7-macos"
 MODE="${1:-run}"
 
 INSTALL_DIR="/usr/local/torobyte-agent"
@@ -651,6 +651,57 @@ web_sample_delta() {
 }
 
 # Devuelve "browser|url" del navegador en foreground (si aplica), usando AppleScript.
+extract_host() {
+  raw=$(printf '%s' "$1" | sed -E 's#^view-source:##; s#^[a-zA-Z]+://##; s#/.*##; s#:[0-9]+$##' | tr 'A-Z' 'a-z')
+  host=$(printf '%s' "$raw" | sed 's/^www\.//')
+  case "$host" in *.*) printf '%s' "$host" ;; *) return 1 ;; esac
+}
+
+history_url_for_browser() {
+  fg="$1"; cu="$2"
+  command -v sqlite3 >/dev/null 2>&1 || return 1
+  home=$(dscl . -read "/Users/$cu" NFSHomeDirectory 2>/dev/null | awk '{print $2}')
+  [ -n "$home" ] || home="/Users/$cu"
+  tmp="$WEBS_STATE_DIR/history.$$.$(printf '%s' "$fg" | tr -c 'a-zA-Z0-9' '_').db"
+  case "$fg" in
+    "Safari"|"Safari Technology Preview")
+      for db in "$home/Library/Safari/History.db"; do
+        [ -r "$db" ] || continue
+        cp "$db" "$tmp" 2>/dev/null || continue
+        sqlite3 -readonly "$tmp" "select hi.url from history_visits hv join history_items hi on hi.id = hv.history_item where hi.url like 'http%' order by hv.visit_time desc limit 1;" 2>/dev/null
+        rm -f "$tmp" 2>/dev/null || true
+        return 0
+      done
+      ;;
+    "Firefox"|"Waterfox"|"LibreWolf")
+      for db in "$home"/Library/Application\ Support/Firefox/Profiles/*.default*/places.sqlite "$home"/Library/Application\ Support/Firefox/Profiles/*.default-release/places.sqlite; do
+        [ -r "$db" ] || continue
+        cp "$db" "$tmp" 2>/dev/null || continue
+        sqlite3 -readonly "$tmp" "select url from moz_places where url like 'http%' and last_visit_date is not null order by last_visit_date desc limit 1;" 2>/dev/null
+        rm -f "$tmp" 2>/dev/null || true
+        return 0
+      done
+      ;;
+    *)
+      for db in \
+        "$home"/Library/Application\ Support/Google/Chrome/*/History \
+        "$home"/Library/Application\ Support/BraveSoftware/Brave-Browser/*/History \
+        "$home"/Library/Application\ Support/Microsoft\ Edge/*/History \
+        "$home"/Library/Application\ Support/Arc/User\ Data/*/History \
+        "$home"/Library/Application\ Support/Vivaldi/*/History \
+        "$home"/Library/Application\ Support/com.operasoftware.Opera/History \
+        "$home"/Library/Application\ Support/com.operasoftware.OperaGX/History; do
+        [ -r "$db" ] || continue
+        cp "$db" "$tmp" 2>/dev/null || continue
+        sqlite3 -readonly "$tmp" "select url from urls where url like 'http%' order by last_visit_time desc limit 1;" 2>/dev/null
+        rm -f "$tmp" 2>/dev/null || true
+        return 0
+      done
+      ;;
+  esac
+  return 1
+}
+
 foreground_browser_url() {
   cu=$(console_user)
   [ -n "$cu" ] && [ "$cu" != "root" ] || return 0
@@ -658,7 +709,7 @@ foreground_browser_url() {
   [ -n "$uid" ] || return 0
   command -v launchctl >/dev/null 2>&1 || return 0
   command -v osascript >/dev/null 2>&1 || return 0
-  fg=$(launchctl asuser "$uid" sudo -u "$cu" osascript -e 'tell application "System Events" to name of first application process whose frontmost is true' 2>/dev/null | tr -d '\n')
+  fg=$(foreground_app 2>/dev/null | tr -d '\n')
   [ -n "$fg" ] || return 0
   url=""
   browser=""
@@ -695,20 +746,14 @@ end try" 2>/dev/null | tr -d '\n')
         dom=$(printf '%s' "$title" | grep -Eio '([a-z0-9](-*[a-z0-9])*\.)+[a-z]{2,24}' | head -1 | tr 'A-Z' 'a-z')
         [ -n "$dom" ] && printf '%s|%s' "$browser" "$dom" && return 0
       fi
-      return 0
+      url=$(history_url_for_browser "$fg" "$cu" 2>/dev/null || true)
       ;;
     *) return 0 ;;
   esac
+  [ -n "$url" ] || url=$(history_url_for_browser "$fg" "$cu" 2>/dev/null || true)
   [ -n "$url" ] || return 0
-  # Extraer host de la URL: quitar esquema, path, puerto
-  host=$(printf '%s' "$url" | sed -E 's#^[a-zA-Z]+://##; s#/.*##; s#:[0-9]+$##' | tr 'A-Z' 'a-z')
-  # Quitar www.
-  host=$(printf '%s' "$host" | sed 's/^www\.//')
-  # Solo aceptar hosts con TLD válido
-  case "$host" in
-    *.*) ;;
-    *) return 0 ;;
-  esac
+  host=$(extract_host "$url" 2>/dev/null || true)
+  [ -n "$host" ] || return 0
   printf '%s|%s' "$browser" "$host"
 }
 
@@ -762,9 +807,13 @@ build_websites_body() {
 
 send_websites() {
   BODY=$(build_websites_body) || return 0
-  post_json "$WEBS_URL" "$BODY" >/dev/null 2>&1 || return 0
-  day=$(date -u +%Y-%m-%d)
-  rm -f "$WEBS_STATE_DIR/$day.active."* 2>/dev/null || true
+  if post_json "$WEBS_URL" "$BODY" >/dev/null 2>&1; then
+    day=$(date -u +%Y-%m-%d)
+    rm -f "$WEBS_STATE_DIR/$day.active."* 2>/dev/null || true
+  else
+    # Fallo de red: mantenemos los contadores para reintentar en el siguiente ciclo.
+    return 0
+  fi
 }
 
 # -------------- Sesiones foreground v2.0.0 (idempotentes por UUID) --------------
