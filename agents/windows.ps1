@@ -836,7 +836,12 @@ function Build-WebsitesPayload {
   return @{ date = (Get-Date).ToUniversalTime().ToString('yyyy-MM-dd'); mode = 'delta'; websites = $sites }
 }
 
-function Reset-WebCounters { $Script:_webActive = @{} }
+function Reset-WebCounters {
+  $Script:_webActive = @{}
+  $Script:_webBrowser = @{}
+  $Script:_webFirst = @{}
+  $Script:_webLast = @{}
+}
 
 # ------------- Foreground sessions v2 (idempotentes por UUID) --------------
 function New-SessionUuid { return [guid]::NewGuid().ToString().ToLowerInvariant() }
@@ -1437,8 +1442,13 @@ function Run-SessionsLoop {
   $appsUrl = Get-IngestEndpoint 'apps'
   $websUrl = Get-IngestEndpoint 'websites'
   $sessionsUrl = Get-IngestEndpoint 'sessions'
-  # Estado local por usuario para no perder metricas si falla el envio
-  try { $Script:_stateFile = Join-Path $InstallDir ("agent-state-{0}.json" -f ([Environment]::UserName).ToLowerInvariant()) } catch {}
+  # Estado local por usuario en una carpeta escribible. La tarea corre con
+  # LeastPrivilege, por lo que ProgramData puede ser solo lectura para usuarios.
+  try {
+    $userStateRoot = if ($env:LOCALAPPDATA) { Join-Path $env:LOCALAPPDATA 'TorobyteAgent' } else { Join-Path $env:TEMP 'TorobyteAgent' }
+    New-Item -ItemType Directory -Force -Path $userStateRoot | Out-Null
+    $Script:_stateFile = Join-Path $userStateRoot ("agent-state-{0}.json" -f ([Environment]::UserName).ToLowerInvariant())
+  } catch {}
   W-Log "torobyte-agent sessions loop $AgentVersion interval=$Interval user=$([Environment]::UserName)"
   Load-AgentState
   while ($true) {
@@ -1449,6 +1459,7 @@ function Run-SessionsLoop {
         try { Sample-Apps $step } catch { W-Log "apps sample error: $($_.Exception.Message)" }
         try { Sample-Websites $step } catch { W-Log "web sample error: $($_.Exception.Message)" }
         try { Sample-Session } catch { W-Log "session sample error: $($_.Exception.Message)" }
+        Save-AgentState
         Start-Sleep -Seconds $step
         $slept += $step
       }
