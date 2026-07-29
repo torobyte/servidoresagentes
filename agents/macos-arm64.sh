@@ -435,6 +435,14 @@ post_json() {
   esac
 }
 
+post_json_plain() {
+  url="$1"; body="$2"
+  HTTP=$(curl -sS --connect-timeout 10 --max-time 30 -o "$RESP_FILE" -w "%{http_code}" -X POST "$url" \
+    -H "Content-Type: application/json; charset=utf-8" \
+    -H "Authorization: Bearer $AGENT_TOKEN" --data "$body") || HTTP="000"
+  case "$HTTP" in 2*) return 0 ;; *) echo "[$(now_iso)] POST(plain) $url http=$HTTP body=$(cat "$RESP_FILE" 2>/dev/null)" >&2; return 1 ;; esac
+}
+
 PUBLIC_INGEST_BASE="${PUBLIC_INGEST_BASE:-https://project--de5cadf8-756e-4d2f-8f8b-6ca62009361b-dev.lovable.app/api/public/ingest}"
 derive_ingest_url() {
   suffix="$1"
@@ -453,6 +461,7 @@ SEC_LAST=0
 
 # -------- Auditoría de seguridad (Ley 21.719) --------
 num() { v=$(printf '%s\n' "${1:-}" | head -n1 | tr -dc '0-9'); [ -n "$v" ] || v=0; printf '%s' "$v"; }
+bool() { case "${1:-}" in true|1|yes|on) printf 'true' ;; *) printf 'false' ;; esac; }
 
 collect_security() {
   OS_NAME="macOS $(sw_vers -productVersion 2>/dev/null)"
@@ -488,9 +497,17 @@ collect_security() {
   PENDING=$(num "$PENDING"); CRITICAL=$(num "$CRITICAL"); LOCK_DELAY=$(num "$LOCK_DELAY")
   ADMIN_COUNT=$(num "$ADMIN_COUNT"); LOCAL_USERS=$(num "$LOCAL_USERS"); OPEN_PORTS=$(num "$OPEN_PORTS")
   case "$RISKY_JSON" in '['*']') : ;; *) RISKY_JSON="[]" ;; esac
-  cat <<JSON
+  FW_ENABLED=$(bool "$FW_ENABLED"); DISK_ENC=$(bool "$DISK_ENC"); SIP_EN=$(bool "$SIP_EN")
+  AV_UPD=$(bool "$AV_UPD"); SCREEN_LOCK=$(bool "$SCREEN_LOCK"); SSH_EN=$(bool "$SSH_EN"); AUDIT_EN=$(bool "$AUDIT_EN")
+  SEC_JSON=$(cat <<JSON
 {"agent_version":"$AGENT_VERSION","os_name":"$(json_escape "$OS_NAME")","os_version":"$(json_escape "$OS_VERSION")","os_build":"$(json_escape "$OS_BUILD")","os_pending_updates":${PENDING:-0},"os_critical_updates":${CRITICAL:-0},"antivirus_name":"XProtect","antivirus_enabled":true,"antivirus_up_to_date":$AV_UPD,"firewall_enabled":$FW_ENABLED,"disk_encryption_enabled":$DISK_ENC,"disk_encryption_method":"FileVault","sip_enabled":$SIP_EN,"screen_lock_enabled":$SCREEN_LOCK,"screen_lock_timeout_seconds":${LOCK_DELAY:-0},"admin_accounts_count":${ADMIN_COUNT:-0},"local_users_count":${LOCAL_USERS:-0},"open_ports_count":${OPEN_PORTS:-0},"risky_open_ports":$RISKY_JSON,"ssh_enabled":$SSH_EN,"rdp_enabled":false,"audit_logging_enabled":$AUDIT_EN}
 JSON
+)
+  SEC_JSON=$(printf '%s' "$SEC_JSON" | tr -d '\n\r')
+  case "$SEC_JSON" in
+    '{'*'}') printf '%s' "$SEC_JSON" ;;
+    *) return 1 ;;
+  esac
 }
 
 
@@ -631,6 +648,8 @@ apply_interval() {
   fi
   NEW_SEC=$(grep -o '"security_interval":[0-9]*' "$RESP_FILE" 2>/dev/null | head -1 | sed 's/.*://')
   case "$NEW_SEC" in ''|*[!0-9]*) : ;; *) [ "$NEW_SEC" -ge 300 ] && SEC_INTERVAL="$NEW_SEC" ;; esac
+  # Solicitud manual de auditoría de seguridad desde la plataforma
+  if grep -q '"security_now":true' "$RESP_FILE" 2>/dev/null; then SEC_LAST=0; fi
 }
 
 
@@ -649,9 +668,18 @@ while true; do
   NOW_TS=$(date +%s)
   if [ "$((NOW_TS - SEC_LAST))" -ge "$SEC_INTERVAL" ]; then
     SEC=$(collect_security 2>/dev/null || echo "")
-    if [ -n "$SEC" ]; then
-      post_json "$SECURITY_URL" "$SEC" >/dev/null 2>&1 && SEC_LAST=$NOW_TS || true
-    fi
+    case "$SEC" in
+      '{'*'}')
+        if post_json "$SECURITY_URL" "$SEC" >/dev/null 2>&1; then
+          SEC_LAST=$NOW_TS
+        elif post_json_plain "$SECURITY_URL" "$SEC" >/dev/null 2>&1; then
+          SEC_LAST=$NOW_TS
+        else
+          echo "[$(now_iso)] security ingest fallido" >&2
+        fi
+        ;;
+      *) echo "[$(now_iso)] security payload invalido, omitido" >&2 ;;
+    esac
   fi
 
   SLEPT=0
