@@ -508,6 +508,8 @@ apply_interval() {
   fi
   NEW_SEC=$(grep -o '"security_interval":[0-9]*' "$RESP_FILE" 2>/dev/null | head -1 | sed 's/.*://')
   case "$NEW_SEC" in ''|*[!0-9]*) : ;; *) [ "$NEW_SEC" -ge 300 ] && SEC_INTERVAL="$NEW_SEC" ;; esac
+  # Solicitud manual de auditoría de seguridad desde la plataforma
+  if grep -q '"security_now":true' "$RESP_FILE" 2>/dev/null; then SEC_LAST=0; fi
 }
 
 while true; do
