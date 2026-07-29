@@ -1102,6 +1102,108 @@ function Post-Json($endpoint, $payload) {
   }
 }
 
+function Try-Get($block) { try { & $block } catch { $null } }
+
+function Collect-Security {
+  $os = Get-CimInstance Win32_OperatingSystem -ErrorAction SilentlyContinue
+  $pending = 0; $critical = 0; $lastUpd = $null
+  Try-Get {
+    $Session = New-Object -ComObject Microsoft.Update.Session
+    $Searcher = $Session.CreateUpdateSearcher()
+    $r = $Searcher.Search("IsInstalled=0 and Type='Software' and IsHidden=0")
+    $pending = $r.Updates.Count
+    $critical = ($r.Updates | Where-Object { $_.MsrcSeverity -eq "Critical" }).Count
+  } | Out-Null
+  $lastUpd = Try-Get { (Get-HotFix -ErrorAction Stop | Sort-Object InstalledOn -Descending | Select-Object -First 1).InstalledOn.ToString("o") }
+  $avName = $null; $avEnabled = $false; $avUpToDate = $false; $defScan = $null
+  Try-Get {
+    $av = Get-CimInstance -Namespace root/SecurityCenter2 -ClassName AntiVirusProduct -ErrorAction Stop | Select-Object -First 1
+    if ($av) {
+      $avName = $av.displayName
+      $state = [int]$av.productState
+      $avEnabled = (($state -band 0x1000) -eq 0x1000)
+      $avUpToDate = (($state -band 0x10) -eq 0)
+    }
+  } | Out-Null
+  if (-not $avName) {
+    Try-Get {
+      $mp = Get-MpComputerStatus -ErrorAction Stop
+      $avName = "Windows Defender"
+      $avEnabled = [bool]$mp.AntivirusEnabled
+      $avUpToDate = ($mp.AntivirusSignatureAge -le 7)
+      $defScan = $mp.QuickScanEndTime
+    } | Out-Null
+  }
+  $fwEnabled = $false; $fwProfiles = @()
+  Try-Get {
+    foreach ($p in (Get-NetFirewallProfile -ErrorAction Stop)) {
+      $fwProfiles += @{ name = $p.Name; enabled = [bool]$p.Enabled }
+      if ($p.Enabled) { $fwEnabled = $true }
+    }
+  } | Out-Null
+  $diskEnc = $false; $diskEncMethod = "BitLocker"
+  Try-Get {
+    $vol = Get-BitLockerVolume -MountPoint "C:" -ErrorAction Stop
+    if ($vol.ProtectionStatus -eq "On") { $diskEnc = $true; $diskEncMethod = "BitLocker $($vol.EncryptionMethod)" }
+  } | Out-Null
+  $uac = $false
+  Try-Get { $uac = ((Get-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System" -Name EnableLUA -ErrorAction Stop).EnableLUA -eq 1) } | Out-Null
+  $screenLock = $false; $screenLockTimeout = 0
+  Try-Get {
+    $reg = Get-ItemProperty -Path "HKCU:\Control Panel\Desktop" -ErrorAction Stop
+    if ($reg.ScreenSaveActive -eq "1" -and [int]$reg.ScreenSaverIsSecure -eq 1) {
+      $screenLock = $true; $screenLockTimeout = [int]$reg.ScreenSaveTimeOut
+    }
+  } | Out-Null
+  $adminCount = 0; $localUsers = 0
+  Try-Get {
+    $adminCount = @(Get-LocalGroupMember -Group "Administradores" -ErrorAction SilentlyContinue).Count
+    if ($adminCount -eq 0) { $adminCount = @(Get-LocalGroupMember -Group "Administrators" -ErrorAction SilentlyContinue).Count }
+    $localUsers = @(Get-LocalUser -ErrorAction SilentlyContinue | Where-Object { $_.Enabled }).Count
+  } | Out-Null
+  $openPortsCount = 0; $risky = @()
+  Try-Get {
+    $ports = (Get-NetTCPConnection -State Listen -ErrorAction Stop).LocalPort | Sort-Object -Unique
+    $openPortsCount = @($ports).Count
+    $riskyList = @(21,23,135,139,445,3389,5900)
+    foreach ($p in $ports) { if ($riskyList -contains $p) { $risky += @{ port = [int]$p } } }
+  } | Out-Null
+  $rdpEnabled = $false
+  Try-Get { $rdpEnabled = ((Get-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server" -Name fDenyTSConnections -ErrorAction Stop).fDenyTSConnections -eq 0) } | Out-Null
+  $auditEnabled = $false
+  Try-Get {
+    $out = & auditpol /get /category:* 2>$null
+    $auditEnabled = @($out | Select-String "Correcto|Success").Count -gt 0
+  } | Out-Null
+  return @{
+    agent_version           = $AgentVersion
+    os_name                 = $os.Caption
+    os_version              = $os.Version
+    os_build                = $os.BuildNumber
+    os_last_update_at       = $lastUpd
+    os_pending_updates      = [int]$pending
+    os_critical_updates     = [int]$critical
+    antivirus_name          = $avName
+    antivirus_enabled       = $avEnabled
+    antivirus_up_to_date    = $avUpToDate
+    antivirus_last_scan_at  = $(if ($defScan) { $defScan.ToString("o") } else { $null })
+    firewall_enabled        = $fwEnabled
+    firewall_profiles       = $fwProfiles
+    disk_encryption_enabled = $diskEnc
+    disk_encryption_method  = $diskEncMethod
+    uac_enabled             = $uac
+    screen_lock_enabled     = $screenLock
+    screen_lock_timeout_seconds = $screenLockTimeout
+    admin_accounts_count    = [int]$adminCount
+    local_users_count       = [int]$localUsers
+    open_ports_count        = [int]$openPortsCount
+    risky_open_ports        = $risky
+    rdp_enabled             = $rdpEnabled
+    ssh_enabled             = $false
+    audit_logging_enabled   = $auditEnabled
+  }
+}
+
 function Get-IngestEndpoint($suffix) {
   $publicBase = if ($env:PUBLIC_INGEST_BASE) { $env:PUBLIC_INGEST_BASE } else { 'https://project--de5cadf8-756e-4d2f-8f8b-6ca62009361b-dev.lovable.app/api/public/ingest' }
   if ($Url -match 'functions\.supabase\.co/ingest-metrics') { return "$publicBase/$suffix" }
@@ -1138,6 +1240,9 @@ function Run-AgentLoop {
   $appsUrl = Get-IngestEndpoint 'apps'
   $websUrl = Get-IngestEndpoint 'websites'
   $sessionsUrl = Get-IngestEndpoint 'sessions'
+  $securityUrl = Get-IngestEndpoint 'security'
+  $Script:_secLastAt = [DateTime]::MinValue
+  $secIntervalMin = 60
 
   W-Log "torobyte-agent $AgentVersion started interval=$Interval endpoint=$Url"
   Load-AgentState
@@ -1207,6 +1312,13 @@ function Run-AgentLoop {
     } catch {
       W-Log "loop error: $($_.Exception.Message)"
     }
+    try {
+      if (((Get-Date) - $Script:_secLastAt).TotalMinutes -ge $secIntervalMin) {
+        $secPayload = Collect-Security
+        $secResp = Post-Json $securityUrl $secPayload
+        if ($secResp) { $Script:_secLastAt = Get-Date }
+      }
+    } catch { W-Log "security post error: $($_.Exception.Message)" }
     if ($env:ONCE -eq '1') { return $cycleOk }
   }
 }
