@@ -479,6 +479,50 @@ SERVICES_URL=$(derive_ingest_url services)
 APPS_URL=$(derive_ingest_url apps)
 SESSIONS_URL=$(derive_ingest_url sessions)
 WEBS_URL=$(derive_ingest_url websites)
+SECURITY_URL=$(derive_ingest_url security)
+SEC_INTERVAL="${SEC_INTERVAL:-3600}"
+SEC_LAST=0
+
+num() { v=$(printf '%s\n' "${1:-}" | head -n1 | tr -dc '0-9'); [ -n "$v" ] || v=0; printf '%s' "$v"; }
+
+collect_security() {
+  OS_NAME="macOS $(sw_vers -productVersion 2>/dev/null)"
+  OS_VERSION=$(sw_vers -productVersion 2>/dev/null)
+  OS_BUILD=$(sw_vers -buildVersion 2>/dev/null)
+  SU_OUT=$(softwareupdate -l 2>/dev/null || true)
+  PENDING=$(printf '%s\n' "$SU_OUT" | grep -c '^\* ')
+  CRITICAL=$(printf '%s\n' "$SU_OUT" | grep -Eic 'security|critical')
+  FW_ENABLED=false
+  defaults read /Library/Preferences/com.apple.alf globalstate 2>/dev/null | grep -q '^[12]$' && FW_ENABLED=true
+  DISK_ENC=false
+  fdesetup status 2>/dev/null | grep -q "FileVault is On" && DISK_ENC=true
+  SIP_EN=false
+  csrutil status 2>/dev/null | grep -q enabled && SIP_EN=true
+  AV_UPD=false
+  XP_DATE=$(stat -f %m /Library/Apple/System/Library/CoreServices/XProtect.bundle 2>/dev/null || stat -f %m /System/Library/CoreServices/XProtect.bundle 2>/dev/null || echo 0)
+  NOW=$(date +%s)
+  [ $((NOW - XP_DATE)) -lt 2592000 ] && AV_UPD=true
+  SCREEN_LOCK=false
+  LOCK=$(defaults -currentHost read com.apple.screensaver askForPassword 2>/dev/null || echo 0)
+  [ "$LOCK" = "1" ] && SCREEN_LOCK=true
+  LOCK_DELAY=$(defaults -currentHost read com.apple.screensaver askForPasswordDelay 2>/dev/null || echo 0)
+  ADMIN_COUNT=$(dscl . -read /Groups/admin GroupMembership 2>/dev/null | awk -F': ' 'NR==1{n=split($2,a," "); print n}')
+  LOCAL_USERS=$(dscl . list /Users 2>/dev/null | grep -vc '^_')
+  OPEN_PORTS=$(lsof -iTCP -sTCP:LISTEN -n -P 2>/dev/null | awk 'NR>1' | wc -l | tr -d ' ')
+  RISKY=$(lsof -iTCP -sTCP:LISTEN -n -P 2>/dev/null | awk 'NR>1 {n=split($9,a,":"); print a[n]}' | sort -u | \
+    awk 'BEGIN{first=1} { p=$1+0; if(p==21||p==23||p==135||p==139||p==445||p==3389||p==5900) { if(!first) printf ","; printf "{\"port\":%d}", p; first=0 } }')
+  RISKY_JSON="[$RISKY]"
+  SSH_EN=false
+  systemsetup -getremotelogin 2>/dev/null | grep -qi 'On' && SSH_EN=true
+  AUDIT_EN=false
+  launchctl list 2>/dev/null | grep -q com.apple.auditd && AUDIT_EN=true
+  PENDING=$(num "$PENDING"); CRITICAL=$(num "$CRITICAL"); LOCK_DELAY=$(num "$LOCK_DELAY")
+  ADMIN_COUNT=$(num "$ADMIN_COUNT"); LOCAL_USERS=$(num "$LOCAL_USERS"); OPEN_PORTS=$(num "$OPEN_PORTS")
+  case "$RISKY_JSON" in '['*']') : ;; *) RISKY_JSON="[]" ;; esac
+  cat <<JSON
+{"agent_version":"$AGENT_VERSION","os_name":"$(json_escape "$OS_NAME")","os_version":"$(json_escape "$OS_VERSION")","os_build":"$(json_escape "$OS_BUILD")","os_pending_updates":${PENDING:-0},"os_critical_updates":${CRITICAL:-0},"antivirus_name":"XProtect","antivirus_enabled":true,"antivirus_up_to_date":$AV_UPD,"firewall_enabled":$FW_ENABLED,"disk_encryption_enabled":$DISK_ENC,"disk_encryption_method":"FileVault","sip_enabled":$SIP_EN,"screen_lock_enabled":$SCREEN_LOCK,"screen_lock_timeout_seconds":${LOCK_DELAY:-0},"admin_accounts_count":${ADMIN_COUNT:-0},"local_users_count":${LOCAL_USERS:-0},"open_ports_count":${OPEN_PORTS:-0},"risky_open_ports":$RISKY_JSON,"ssh_enabled":$SSH_EN,"rdp_enabled":false,"audit_logging_enabled":$AUDIT_EN}
+JSON
+}
 
 # -------------------------- Aplicaciones (uso) --------------------------
 APPS_STATE_DIR="${TMPDIR:-/tmp}/torobyte-apps"
@@ -1007,7 +1051,10 @@ apply_interval() {
     echo "[$(now_iso)] interval cambiado ${INTERVAL}s -> ${NEW_INT}s"
     INTERVAL="$NEW_INT"
   fi
+  NEW_SEC=$(grep -o '"security_interval":[0-9]*' "$RESP_FILE" 2>/dev/null | head -1 | sed 's/.*://')
+  case "$NEW_SEC" in ''|*[!0-9]*) : ;; *) [ "$NEW_SEC" -ge 300 ] && SEC_INTERVAL="$NEW_SEC" ;; esac
 }
+
 
 send_runtime_error() {
   msg=$(json_escape "$1")
@@ -1048,6 +1095,14 @@ while true; do
   # Sitios web visitados (dominio del navegador en foreground)
   sample_websites 2>/dev/null || true
   send_websites 2>/dev/null || true
+
+  NOW_TS=$(date +%s)
+  if [ "$((NOW_TS - SEC_LAST))" -ge "$SEC_INTERVAL" ]; then
+    SEC=$(collect_security 2>/dev/null || echo "")
+    if [ -n "$SEC" ]; then
+      post_json "$SECURITY_URL" "$SEC" >/dev/null 2>&1 && SEC_LAST=$NOW_TS || true
+    fi
+  fi
 
 
 
