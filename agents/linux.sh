@@ -412,6 +412,64 @@ PROC_URL=$(derive_ingest_url processes)
 PORTS_URL=$(derive_ingest_url ports)
 DISKS_URL=$(derive_ingest_url disks)
 SERVICES_URL=$(derive_ingest_url services)
+SECURITY_URL=$(derive_ingest_url security)
+SEC_INTERVAL="${SEC_INTERVAL:-3600}"
+SEC_LAST=0
+
+num() { v=$(printf '%s\n' "${1:-}" | head -n1 | tr -dc '0-9'); [ -n "$v" ] || v=0; printf '%s' "$v"; }
+
+collect_security() {
+  OS_NAME=$(. /etc/os-release 2>/dev/null; echo "${PRETTY_NAME:-Linux}")
+  OS_VERSION=$(. /etc/os-release 2>/dev/null; echo "${VERSION_ID:-}")
+  OS_BUILD=$(uname -r)
+  PENDING=0; CRITICAL=0; LAST_UPDATE=""
+  if command -v apt >/dev/null 2>&1; then
+    PENDING=$(apt list --upgradable 2>/dev/null | grep -c upgradable)
+    CRITICAL=$(apt list --upgradable 2>/dev/null | grep -ic security)
+    LAST_UPDATE=$(stat -c %y /var/lib/apt/periodic/update-success-stamp 2>/dev/null | awk '{print $1"T"$2}' | cut -c1-19)
+  elif command -v dnf >/dev/null 2>&1; then
+    PENDING=$(dnf -q check-update 2>/dev/null | grep -c '^[a-zA-Z]')
+    CRITICAL=$(dnf -q updateinfo list security 2>/dev/null | grep -c '/')
+  elif command -v yum >/dev/null 2>&1; then
+    PENDING=$(yum -q check-update 2>/dev/null | grep -c '^[a-zA-Z]')
+  fi
+
+  FW_ENABLED=false
+  command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -qi active && FW_ENABLED=true
+  command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state 2>/dev/null | grep -q running && FW_ENABLED=true
+  command -v nft >/dev/null 2>&1 && [ -n "$(nft list ruleset 2>/dev/null)" ] && FW_ENABLED=true
+  DISK_ENC=false
+  command -v lsblk >/dev/null 2>&1 && lsblk -o TYPE 2>/dev/null | grep -q crypt && DISK_ENC=true
+  AV_NAME=""; AV_EN=false; AV_UPD=false
+  if command -v clamscan >/dev/null 2>&1 || systemctl is-active --quiet clamav-daemon 2>/dev/null; then
+    AV_NAME="ClamAV"
+    systemctl is-active --quiet clamav-daemon 2>/dev/null && AV_EN=true
+    if [ -f /var/log/clamav/freshclam.log ]; then
+      LAST=$(stat -c %Y /var/log/clamav/freshclam.log 2>/dev/null || echo 0)
+      NOW=$(date +%s)
+      [ $((NOW - LAST)) -lt 604800 ] && AV_UPD=true
+    fi
+  fi
+  ADMIN_COUNT=$(getent group sudo wheel 2>/dev/null | awk -F: '{n=split($4,a,","); print n}' | awk '{s+=$1} END{print s+0}')
+  LOCAL_USERS=$(awk -F: '$3>=1000 && $1!="nobody" {c++} END{print c+0}' /etc/passwd)
+  OPEN_PORTS=0; RISKY_JSON="[]"
+  if command -v ss >/dev/null 2>&1; then
+    OPEN_PORTS=$(ss -tuln 2>/dev/null | awk 'NR>1 {print $5}' | wc -l)
+    RISKY=$(ss -tuln 2>/dev/null | awk 'NR>1 {n=split($5,a,":"); p=a[n]; print p}' | sort -u | \
+      awk 'BEGIN{first=1} { if($1==21||$1==23||$1==135||$1==139||$1==445||$1==3389||$1==5900) { if(!first) printf ","; printf "{\"port\":%d}", $1; first=0 } }')
+    RISKY_JSON="[$RISKY]"
+  fi
+  SSH_EN=false; systemctl is-active --quiet ssh sshd 2>/dev/null && SSH_EN=true
+  AUDIT_EN=false; systemctl is-active --quiet auditd 2>/dev/null && AUDIT_EN=true
+  SCREEN_LOCK=false
+  command -v gsettings >/dev/null 2>&1 && gsettings get org.gnome.desktop.screensaver lock-enabled 2>/dev/null | grep -q true && SCREEN_LOCK=true
+  PENDING=$(num "$PENDING"); CRITICAL=$(num "$CRITICAL")
+  ADMIN_COUNT=$(num "$ADMIN_COUNT"); LOCAL_USERS=$(num "$LOCAL_USERS"); OPEN_PORTS=$(num "$OPEN_PORTS")
+  case "$RISKY_JSON" in '['*']') : ;; *) RISKY_JSON="[]" ;; esac
+  cat <<JSON
+{"agent_version":"$AGENT_VERSION","os_name":"$(json_escape "$OS_NAME")","os_version":"$(json_escape "$OS_VERSION")","os_build":"$(json_escape "$OS_BUILD")","os_last_update_at":$( [ -n "$LAST_UPDATE" ] && echo "\"${LAST_UPDATE}Z\"" || echo null ),"os_pending_updates":${PENDING:-0},"os_critical_updates":${CRITICAL:-0},"antivirus_name":$( [ -n "$AV_NAME" ] && echo "\"$AV_NAME\"" || echo null ),"antivirus_enabled":$AV_EN,"antivirus_up_to_date":$AV_UPD,"firewall_enabled":$FW_ENABLED,"disk_encryption_enabled":$DISK_ENC,"disk_encryption_method":"LUKS","screen_lock_enabled":$SCREEN_LOCK,"admin_accounts_count":${ADMIN_COUNT:-0},"local_users_count":${LOCAL_USERS:-0},"open_ports_count":${OPEN_PORTS:-0},"risky_open_ports":$RISKY_JSON,"ssh_enabled":$SSH_EN,"rdp_enabled":false,"audit_logging_enabled":$AUDIT_EN}
+JSON
+}
 
 trap 'rm -f "$RESP_FILE"' EXIT
 echo "[$(now_iso)] torobyte-agent $AGENT_VERSION started interval=${INTERVAL}s endpoint=${INGEST_URL}"
@@ -448,6 +506,8 @@ apply_interval() {
     echo "[$(now_iso)] interval cambiado ${INTERVAL}s -> ${NEW_INT}s"
     INTERVAL="$NEW_INT"
   fi
+  NEW_SEC=$(grep -o '"security_interval":[0-9]*' "$RESP_FILE" 2>/dev/null | head -1 | sed 's/.*://')
+  case "$NEW_SEC" in ''|*[!0-9]*) : ;; *) [ "$NEW_SEC" -ge 300 ] && SEC_INTERVAL="$NEW_SEC" ;; esac
 }
 
 while true; do
@@ -465,6 +525,22 @@ while true; do
   post_json "$DISKS_URL" "{\"disks\":$DISKS}" >/dev/null 2>&1 || true
   SERVICES=$(collect_services 2>/dev/null || echo "[]")
   post_json "$SERVICES_URL" "{\"services\":$SERVICES}" >/dev/null 2>&1 || true
+
+  NOW_TS=$(date +%s)
+  if [ "$((NOW_TS - SEC_LAST))" -ge "$SEC_INTERVAL" ]; then
+    SEC=$(collect_security 2>/dev/null || echo "")
+    if [ -n "$SEC" ]; then
+      if post_json "$SECURITY_URL" "$SEC"; then
+        SEC_LAST=$NOW_TS
+        echo "[$(now_iso)] security audit ok"
+      else
+        echo "[$(now_iso)] security audit failed" >&2
+      fi
+    else
+      echo "[$(now_iso)] security audit: sin datos" >&2
+    fi
+  fi
+
 
   if [ "$ONCE" = "1" ]; then exit 0; fi
   sleep "$INTERVAL"
