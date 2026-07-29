@@ -1263,6 +1263,16 @@ function Run-AgentLoop {
           W-Log ("interval cambiado {0}s -> {1}s" -f $script:Interval, $newInt)
           $script:Interval = $newInt
         }
+        try {
+          $newSec = [int]$resp.security_interval
+          if ($newSec -ge 300 -and $newSec -le 604800) { $secIntervalMin = [int][Math]::Round($newSec / 60) }
+        } catch {}
+        try {
+          if ($resp.security_now -eq $true) {
+            W-Log 'auditoria de seguridad solicitada manualmente'
+            $Script:_secLastAt = [DateTime]::MinValue
+          }
+        } catch {}
       } else {
         W-Log 'metrics failed'
       }
