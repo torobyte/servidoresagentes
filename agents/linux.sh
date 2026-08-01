@@ -7,7 +7,7 @@ AGENT_TOKEN="${AGENT_TOKEN:-${TOKEN:-}}"
 INGEST_URL="${INGEST_URL:-${URL:-}}"
 INTERVAL="${INTERVAL:-5}"
 ONCE="${ONCE:-0}"
-AGENT_VERSION="2.2.0-linux"
+AGENT_VERSION="2.2.8-linux"
 MODE="${1:-run}"
 
 step() { printf "\033[1;36m[%s/%s]\033[0m %s\n" "$1" "$2" "$3"; }
@@ -203,6 +203,23 @@ private_ip() {
   printf '%s' "$ip_addr"
 }
 
+wifi_aps_json() {
+  # Redes Wi-Fi cercanas (BSSID + senal) para geolocalizacion precisa. Cache 10 min.
+  cache="/tmp/.torobyte-wifi.json"
+  if [ -f "$cache" ]; then
+    mt=$(stat -c %Y "$cache" 2>/dev/null || echo 0)
+    if [ $(( $(date +%s) - mt )) -lt 600 ]; then cat "$cache"; return; fi
+  fi
+  aps=""
+  if command -v nmcli >/dev/null 2>&1; then
+    aps=$(nmcli -t -f BSSID,SIGNAL dev wifi list 2>/dev/null | tr -d '\\' | awk -F: '
+      { if (NF >= 7) { mac=tolower($1":"$2":"$3":"$4":"$5":"$6); pct=$7+0;
+          if (n < 24 && mac ~ /^[0-9a-f][0-9a-f]:/) { printf "%s{\"mac\":\"%s\",\"rssi\":%d}", (n++ ? "," : ""), mac, (pct/2)-100 } } }')
+  fi
+  printf '[%s]' "$aps" > "$cache" 2>/dev/null
+  printf '[%s]' "$aps"
+}
+
 collect() {
   hostname_v=$(hostname 2>/dev/null || uname -n 2>/dev/null || echo unknown)
   kernel=$(uname -r 2>/dev/null || echo unknown)
@@ -224,6 +241,7 @@ collect() {
   total_ram=$(awk '/MemTotal/ {printf "%.1f GB", $2/1024/1024}' /proc/meminfo 2>/dev/null)
   [ -n "$total_ram" ] || total_ram="0 GB"
   priv_ip=$(private_ip)
+  wifi_aps=$(wifi_aps_json); [ -n "$wifi_aps" ] || wifi_aps="[]"
   pub_ip=$(curl -fsS --connect-timeout 2 --max-time 4 https://api.ipify.org 2>/dev/null || echo "")
   uptime_v=$(uptime -p 2>/dev/null | sed 's/^up //')
   [ -n "$uptime_v" ] || uptime_v=$(awk '{printf "%d s", $1}' /proc/uptime 2>/dev/null || echo "0 s")
@@ -276,7 +294,7 @@ collect() {
   case "$latency_ms" in ''|*[!0-9]*) latency_ms=0 ;; esac
 
   cat <<EOF
-{"hostname":"$(json_escape "$hostname_v")","os":"$(json_escape "$os_name")","kernel":"$(json_escape "$kernel")","arch":"$(json_escape "$arch")","cores":$cores,"cpu_model":"$(json_escape "$cpu_model")","total_ram":"$(json_escape "$total_ram")","total_disk":"$(json_escape "$total_disk")","public_ip":"$(json_escape "$pub_ip")","private_ip":"$(json_escape "$priv_ip")","uptime":"$(json_escape "$uptime_v")","cpu":$cpu,"cpu_cores":$cpu_cores_arr,"ram":$ram,"disk":$disk,"network_in":$net_in,"network_out":$net_out,"load_avg":{"1":$l1,"5":$l5,"15":$l15},"gpu":"$(json_escape "$gpu")","motherboard":"$(json_escape "$motherboard")","mac_address":"$(json_escape "$mac_addr")","manufacturer":"$(json_escape "$sys_vendor")","hw_model":"$(json_escape "$sys_product")","serial_number":"$(json_escape "$sys_serial")","latency_ms":$latency_ms,"agent_version":"$AGENT_VERSION"}
+{"hostname":"$(json_escape "$hostname_v")","os":"$(json_escape "$os_name")","kernel":"$(json_escape "$kernel")","arch":"$(json_escape "$arch")","cores":$cores,"cpu_model":"$(json_escape "$cpu_model")","total_ram":"$(json_escape "$total_ram")","total_disk":"$(json_escape "$total_disk")","public_ip":"$(json_escape "$pub_ip")","wifi_aps":$wifi_aps,"private_ip":"$(json_escape "$priv_ip")","uptime":"$(json_escape "$uptime_v")","cpu":$cpu,"cpu_cores":$cpu_cores_arr,"ram":$ram,"disk":$disk,"network_in":$net_in,"network_out":$net_out,"load_avg":{"1":$l1,"5":$l5,"15":$l15},"gpu":"$(json_escape "$gpu")","motherboard":"$(json_escape "$motherboard")","mac_address":"$(json_escape "$mac_addr")","manufacturer":"$(json_escape "$sys_vendor")","hw_model":"$(json_escape "$sys_product")","serial_number":"$(json_escape "$sys_serial")","latency_ms":$latency_ms,"agent_version":"$AGENT_VERSION"}
 EOF
 }
 
@@ -340,6 +358,30 @@ collect_disks() {
       gsub(/\\/,"\\\\",fstype); gsub(/"/,"\\\"",fstype)
       if (first) printf ","; first=1
       printf "{\"device\":\"%s\",\"mountpoint\":\"%s\",\"fstype\":\"%s\",\"total_bytes\":%d,\"used_bytes\":%d,\"free_bytes\":%d,\"use_percent\":%s}", device,mp,fstype,total,used,free,(pct+0)
+    }
+    END{printf "]"}'
+}
+
+collect_programs() {
+  {
+    if command -v dpkg-query >/dev/null 2>&1; then
+      dpkg-query -W -f='${Package}|${Version}|${Maintainer}|${Installed-Size}|dpkg\n' 2>/dev/null
+    elif command -v rpm >/dev/null 2>&1; then
+      rpm -qa --qf '%{NAME}|%{VERSION}-%{RELEASE}|%{VENDOR}|%{SIZE}|rpm\n' 2>/dev/null
+    elif command -v apk >/dev/null 2>&1; then
+      apk info -v 2>/dev/null | awk '{print $1"|||0|apk"}'
+    fi
+  } | awk -F'|' -v arch="$(uname -m)" '
+    function esc(s) { gsub(/\\/,"\\\\",s); gsub(/"/,"\\\"",s); return s }
+    BEGIN{printf "["; first=1}
+    NF>=5 && $1 != "" {
+      size="null"
+      if ($4 ~ /^[0-9]+$/ && $4+0 > 0) {
+        if ($5 == "rpm") size=sprintf("%.1f", $4/1048576); else size=sprintf("%.1f", $4/1024)
+      }
+      if (!first) printf ","
+      first=0
+      printf "{\"name\":\"%s\",\"version\":\"%s\",\"publisher\":\"%s\",\"size_mb\":%s,\"arch\":\"%s\",\"source\":\"%s\"}", esc($1), esc($2), esc($3), size, arch, esc($5)
     }
     END{printf "]"}'
 }
@@ -413,61 +455,166 @@ PORTS_URL=$(derive_ingest_url ports)
 DISKS_URL=$(derive_ingest_url disks)
 SERVICES_URL=$(derive_ingest_url services)
 SECURITY_URL=$(derive_ingest_url security)
+PROGRAMS_URL=$(derive_ingest_url programs)
+PROG_LAST=0
+PROG_INTERVAL=21600
 SEC_INTERVAL="${SEC_INTERVAL:-3600}"
 SEC_LAST=0
 
 num() { v=$(printf '%s\n' "${1:-}" | head -n1 | tr -dc '0-9'); [ -n "$v" ] || v=0; printf '%s' "$v"; }
+# sint: entero con signo. Permite -1 = desconocido (no confundir con 0).
+sint() { v=$(printf '%s\n' "${1:-}" | head -n1 | tr -dc '0-9-'); case "$v" in ""|-) v=-1 ;; esac; printf '%s' "$v"; }
 
 collect_security() {
   OS_NAME=$(. /etc/os-release 2>/dev/null; echo "${PRETTY_NAME:-Linux}")
   OS_VERSION=$(. /etc/os-release 2>/dev/null; echo "${VERSION_ID:-}")
   OS_BUILD=$(uname -r)
-  PENDING=0; CRITICAL=0; LAST_UPDATE=""
-  if command -v apt >/dev/null 2>&1; then
-    PENDING=$(apt list --upgradable 2>/dev/null | grep -c upgradable)
-    CRITICAL=$(apt list --upgradable 2>/dev/null | grep -ic security)
+  # -1 = desconocido. Nunca se reporta 0 si el gestor de paquetes no respondio.
+  PENDING=-1; CRITICAL=-1; LAST_UPDATE=""; UPD_SOURCE="unavailable"
+  if command -v apt-get >/dev/null 2>&1; then
+    SIM=$(apt-get -s -o Debug::NoLocking=1 dist-upgrade 2>/dev/null || true)
+    if [ -n "$SIM" ]; then
+      PENDING=$(printf '%s\n' "$SIM" | grep -c '^Inst ')
+      CRITICAL=$(printf '%s\n' "$SIM" | grep '^Inst ' | grep -Eic 'security')
+      UPD_SOURCE="apt-get-sim"
+    else
+      UPG=$(apt list --upgradable 2>/dev/null | grep 'upgradable' || true)
+      if [ -n "$UPG" ]; then
+        PENDING=$(printf '%s\n' "$UPG" | grep -c 'upgradable')
+        CRITICAL=$(printf '%s\n' "$UPG" | grep -ic security)
+        UPD_SOURCE="apt-list"
+      fi
+    fi
     LAST_UPDATE=$(stat -c %y /var/lib/apt/periodic/update-success-stamp 2>/dev/null | awk '{print $1"T"$2}' | cut -c1-19)
+    [ -n "$LAST_UPDATE" ] || LAST_UPDATE=$(stat -c %y /var/log/dpkg.log 2>/dev/null | awk '{print $1"T"$2}' | cut -c1-19)
   elif command -v dnf >/dev/null 2>&1; then
-    PENDING=$(dnf -q check-update 2>/dev/null | grep -c '^[a-zA-Z]')
+    OUT=$(dnf -q check-update 2>/dev/null || true)
+    PENDING=$(printf '%s\n' "$OUT" | grep -c '^[a-zA-Z]')
     CRITICAL=$(dnf -q updateinfo list security 2>/dev/null | grep -c '/')
+    UPD_SOURCE="dnf"
+    LAST_UPDATE=$(stat -c %y /var/log/dnf.rpm.log 2>/dev/null | awk '{print $1"T"$2}' | cut -c1-19)
   elif command -v yum >/dev/null 2>&1; then
-    PENDING=$(yum -q check-update 2>/dev/null | grep -c '^[a-zA-Z]')
+    OUT=$(yum -q check-update 2>/dev/null || true)
+    PENDING=$(printf '%s\n' "$OUT" | grep -c '^[a-zA-Z]')
+    CRITICAL=0
+    UPD_SOURCE="yum"
+  elif command -v zypper >/dev/null 2>&1; then
+    PENDING=$(zypper -q list-updates 2>/dev/null | grep -c '^v |')
+    CRITICAL=$(zypper -q list-patches --category security 2>/dev/null | grep -c 'security')
+    UPD_SOURCE="zypper"
   fi
 
-  FW_ENABLED=false
-  command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -qi active && FW_ENABLED=true
-  command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state 2>/dev/null | grep -q running && FW_ENABLED=true
-  command -v nft >/dev/null 2>&1 && [ -n "$(nft list ruleset 2>/dev/null)" ] && FW_ENABLED=true
-  DISK_ENC=false
-  command -v lsblk >/dev/null 2>&1 && lsblk -o TYPE 2>/dev/null | grep -q crypt && DISK_ENC=true
-  AV_NAME=""; AV_EN=false; AV_UPD=false
-  if command -v clamscan >/dev/null 2>&1 || systemctl is-active --quiet clamav-daemon 2>/dev/null; then
-    AV_NAME="ClamAV"
-    systemctl is-active --quiet clamav-daemon 2>/dev/null && AV_EN=true
-    if [ -f /var/log/clamav/freshclam.log ]; then
-      LAST=$(stat -c %Y /var/log/clamav/freshclam.log 2>/dev/null || echo 0)
-      NOW=$(date +%s)
-      [ $((NOW - LAST)) -lt 604800 ] && AV_UPD=true
+  # tbool: 3 estados (true/false/null). null = no se pudo determinar.
+  tbool() { case "${1:-}" in true|1|yes|on) printf 'true' ;; false|0|no|off) printf 'false' ;; *) printf 'null' ;; esac; }
+
+  # Firewall: se evalúan todos los motores presentes. Si ninguno está
+  # instalado el estado es desconocido (null), no "desactivado".
+  FW_ENABLED=null
+  if command -v ufw >/dev/null 2>&1; then
+    UFW_OUT=$(ufw status 2>/dev/null || true)
+    printf '%s' "$UFW_OUT" | grep -qi 'Status: active' && FW_ENABLED=true
+    printf '%s' "$UFW_OUT" | grep -qi 'Status: inactive' && [ "$FW_ENABLED" != "true" ] && FW_ENABLED=false
+  fi
+  if [ "$FW_ENABLED" != "true" ] && command -v firewall-cmd >/dev/null 2>&1; then
+    FWD_OUT=$(firewall-cmd --state 2>/dev/null || true)
+    printf '%s' "$FWD_OUT" | grep -q running && FW_ENABLED=true
+    printf '%s' "$FWD_OUT" | grep -q 'not running' && [ "$FW_ENABLED" != "true" ] && FW_ENABLED=false
+  fi
+  if [ "$FW_ENABLED" != "true" ] && command -v nft >/dev/null 2>&1; then
+    NFT_OUT=$(nft list ruleset 2>/dev/null || true)
+    if printf '%s' "$NFT_OUT" | grep -q 'chain'; then FW_ENABLED=true; fi
+  fi
+  if [ "$FW_ENABLED" != "true" ] && command -v iptables >/dev/null 2>&1; then
+    IPT_OUT=$(iptables -S 2>/dev/null || true)
+    if printf '%s\n' "$IPT_OUT" | grep -qE '^-A ' || printf '%s\n' "$IPT_OUT" | grep -qE '^-P (INPUT|FORWARD) DROP'; then
+      FW_ENABLED=true
+    elif [ -n "$IPT_OUT" ] && [ "$FW_ENABLED" = "null" ]; then
+      FW_ENABLED=false
     fi
   fi
-  ADMIN_COUNT=$(getent group sudo wheel 2>/dev/null | awk -F: '{n=split($4,a,","); print n}' | awk '{s+=$1} END{print s+0}')
-  LOCAL_USERS=$(awk -F: '$3>=1000 && $1!="nobody" {c++} END{print c+0}' /etc/passwd)
-  OPEN_PORTS=0; RISKY_JSON="[]"
+
+  # Cifrado de disco: LUKS o dm-crypt. Sin herramientas -> desconocido.
+  DISK_ENC=null
+  if command -v lsblk >/dev/null 2>&1; then
+    if lsblk -o TYPE 2>/dev/null | grep -q crypt; then DISK_ENC=true; else DISK_ENC=false; fi
+  fi
+  if [ "$DISK_ENC" != "true" ]; then
+    if [ -s /etc/crypttab ] && grep -qv '^[[:space:]]*#' /etc/crypttab 2>/dev/null; then DISK_ENC=true; fi
+    if [ "$DISK_ENC" != "true" ] && command -v dmsetup >/dev/null 2>&1; then
+      dmsetup ls --target crypt 2>/dev/null | grep -qv 'No devices' && dmsetup ls --target crypt 2>/dev/null | grep -q '.' && DISK_ENC=true
+    fi
+  fi
+
+  AV_NAME=""; AV_EN=null; AV_UPD=null
+  if command -v clamscan >/dev/null 2>&1 || command -v clamdscan >/dev/null 2>&1 || systemctl list-unit-files 2>/dev/null | grep -q '^clamav-daemon'; then
+    AV_NAME="ClamAV"
+    if systemctl is-active --quiet clamav-daemon 2>/dev/null || systemctl is-active --quiet clamd@scan 2>/dev/null; then AV_EN=true; else AV_EN=false; fi
+    for FL in /var/log/clamav/freshclam.log /var/lib/clamav/daily.cvd /var/lib/clamav/daily.cld; do
+      if [ -e "$FL" ]; then
+        LAST=$(stat -c %Y "$FL" 2>/dev/null || echo 0)
+        NOW=$(date +%s)
+        if [ $((NOW - LAST)) -lt 604800 ]; then AV_UPD=true; elif [ "$AV_UPD" != "true" ]; then AV_UPD=false; fi
+      fi
+    done
+  fi
+  ADMIN_COUNT=$( { getent group sudo; getent group wheel; getent group admin; } 2>/dev/null | awk -F: '{n=split($4,a,","); for(i=1;i<=n;i++) if(a[i]!="") print a[i]}' | sort -u | wc -l)
+  LOCAL_USERS=$(awk -F: '$3>=1000 && $3<65534 && $1!="nobody" {c++} END{print c+0}' /etc/passwd)
+
+  # Puertos: se cuentan puertos únicos en escucha y se adjunta la dirección
+  # de escucha de los puertos riesgosos.
+  OPEN_PORTS=-1; RISKY_JSON="[]"
+  SS_OUT=""
   if command -v ss >/dev/null 2>&1; then
-    OPEN_PORTS=$(ss -tuln 2>/dev/null | awk 'NR>1 {print $5}' | wc -l)
-    RISKY=$(ss -tuln 2>/dev/null | awk 'NR>1 {n=split($5,a,":"); p=a[n]; print p}' | sort -u | \
-      awk 'BEGIN{first=1} { if($1==21||$1==23||$1==135||$1==139||$1==445||$1==3389||$1==5900) { if(!first) printf ","; printf "{\"port\":%d}", $1; first=0 } }')
+    SS_OUT=$(ss -tulnH 2>/dev/null || ss -tuln 2>/dev/null | awk 'NR>1')
+  elif command -v netstat >/dev/null 2>&1; then
+    SS_OUT=$(netstat -tuln 2>/dev/null | awk 'NR>2')
+  fi
+  if [ -n "$SS_OUT" ]; then
+    OPEN_PORTS=$(printf '%s\n' "$SS_OUT" | awk '{for(i=1;i<=NF;i++) if($i ~ /:[0-9]+$/){n=split($i,a,":"); print a[n]; break}}' | grep '^[0-9]' | sort -u | wc -l)
+    RISKY=$(printf '%s\n' "$SS_OUT" | awk '{addr=""; for(i=1;i<=NF;i++) if($i ~ /:[0-9]+$/){addr=$i; break} if(addr==""){next} n=split(addr,a,":"); port=a[n]; host=substr(addr,1,length(addr)-length(port)-1); if(host=="") host="*"; print port"|"host}' | sort -u | \
+      awk -F'|' 'BEGIN{first=1} !seen[$1]++ { p=$1+0; if(p==21||p==23||p==135||p==139||p==445||p==3389||p==5900||p==3306||p==5432||p==6379||p==27017||p==11211||p==1433) { if(!first) printf ","; printf "{\"port\":%d,\"address\":\"%s\",\"protocol\":\"tcp\"}", p, $2; first=0 } }')
     RISKY_JSON="[$RISKY]"
   fi
-  SSH_EN=false; systemctl is-active --quiet ssh sshd 2>/dev/null && SSH_EN=true
-  AUDIT_EN=false; systemctl is-active --quiet auditd 2>/dev/null && AUDIT_EN=true
-  SCREEN_LOCK=false
-  command -v gsettings >/dev/null 2>&1 && gsettings get org.gnome.desktop.screensaver lock-enabled 2>/dev/null | grep -q true && SCREEN_LOCK=true
-  PENDING=$(num "$PENDING"); CRITICAL=$(num "$CRITICAL")
-  ADMIN_COUNT=$(num "$ADMIN_COUNT"); LOCAL_USERS=$(num "$LOCAL_USERS"); OPEN_PORTS=$(num "$OPEN_PORTS")
+
+  SSH_EN=null
+  if systemctl list-unit-files 2>/dev/null | grep -qE '^(ssh|sshd)\.(service|socket)'; then
+    if systemctl is-active --quiet ssh 2>/dev/null || systemctl is-active --quiet sshd 2>/dev/null || systemctl is-active --quiet ssh.socket 2>/dev/null; then SSH_EN=true; else SSH_EN=false; fi
+  elif [ -n "$SS_OUT" ]; then
+    if printf '%s\n' "$SS_OUT" | awk '{for(i=1;i<=NF;i++) if($i ~ /:[0-9]+$/){n=split($i,a,":"); print a[n]; break}}' | grep -q '^22$'; then SSH_EN=true; else SSH_EN=false; fi
+  fi
+
+  AUDIT_EN=null
+  if systemctl list-unit-files 2>/dev/null | grep -q '^auditd'; then
+    if systemctl is-active --quiet auditd 2>/dev/null; then AUDIT_EN=true; else AUDIT_EN=false; fi
+  elif command -v auditctl >/dev/null 2>&1; then
+    auditctl -s 2>/dev/null | grep -q 'enabled 1' && AUDIT_EN=true
+  elif [ -d /var/log/journal ] || [ -f /var/log/syslog ] || [ -f /var/log/messages ]; then
+    AUDIT_EN=true
+  fi
+
+  # Bloqueo de pantalla: sólo aplica a equipos con escritorio gráfico.
+  # En servidores headless se reporta desconocido en vez de "desactivado".
+  SCREEN_LOCK=null
+  if [ -n "$(ls /usr/share/xsessions /usr/share/wayland-sessions 2>/dev/null)" ]; then
+    SCREEN_LOCK=false
+    if command -v gsettings >/dev/null 2>&1; then
+      GSU=$(ls -1 /home 2>/dev/null | head -1)
+      GS_OUT=$(gsettings get org.gnome.desktop.screensaver lock-enabled 2>/dev/null || true)
+      [ -n "$GS_OUT" ] || GS_OUT=$( [ -n "$GSU" ] && sudo -u "$GSU" gsettings get org.gnome.desktop.screensaver lock-enabled 2>/dev/null || true)
+      printf '%s' "$GS_OUT" | grep -q true && SCREEN_LOCK=true
+      [ -z "$GS_OUT" ] && SCREEN_LOCK=null
+    else
+      SCREEN_LOCK=null
+    fi
+  fi
+  PENDING=$(sint "$PENDING"); CRITICAL=$(sint "$CRITICAL")
+  ADMIN_COUNT=$(num "$ADMIN_COUNT"); LOCAL_USERS=$(num "$LOCAL_USERS"); OPEN_PORTS=$(sint "$OPEN_PORTS")
   case "$RISKY_JSON" in '['*']') : ;; *) RISKY_JSON="[]" ;; esac
+  FW_ENABLED=$(tbool "$FW_ENABLED"); DISK_ENC=$(tbool "$DISK_ENC"); AV_EN=$(tbool "$AV_EN")
+  AV_UPD=$(tbool "$AV_UPD"); SSH_EN=$(tbool "$SSH_EN"); AUDIT_EN=$(tbool "$AUDIT_EN")
+  SCREEN_LOCK=$(tbool "$SCREEN_LOCK")
   cat <<JSON
-{"agent_version":"$AGENT_VERSION","os_name":"$(json_escape "$OS_NAME")","os_version":"$(json_escape "$OS_VERSION")","os_build":"$(json_escape "$OS_BUILD")","os_last_update_at":$( [ -n "$LAST_UPDATE" ] && echo "\"${LAST_UPDATE}Z\"" || echo null ),"os_pending_updates":${PENDING:-0},"os_critical_updates":${CRITICAL:-0},"antivirus_name":$( [ -n "$AV_NAME" ] && echo "\"$AV_NAME\"" || echo null ),"antivirus_enabled":$AV_EN,"antivirus_up_to_date":$AV_UPD,"firewall_enabled":$FW_ENABLED,"disk_encryption_enabled":$DISK_ENC,"disk_encryption_method":"LUKS","screen_lock_enabled":$SCREEN_LOCK,"admin_accounts_count":${ADMIN_COUNT:-0},"local_users_count":${LOCAL_USERS:-0},"open_ports_count":${OPEN_PORTS:-0},"risky_open_ports":$RISKY_JSON,"ssh_enabled":$SSH_EN,"rdp_enabled":false,"audit_logging_enabled":$AUDIT_EN}
+{"agent_version":"$AGENT_VERSION","os_name":"$(json_escape "$OS_NAME")","os_version":"$(json_escape "$OS_VERSION")","os_build":"$(json_escape "$OS_BUILD")","os_last_update_at":$( [ -n "$LAST_UPDATE" ] && echo "\"${LAST_UPDATE}Z\"" || echo null ),"updates_source":"$UPD_SOURCE","os_pending_updates":$PENDING,"os_critical_updates":$CRITICAL,"antivirus_name":$( [ -n "$AV_NAME" ] && echo "\"$AV_NAME\"" || echo null ),"antivirus_enabled":$AV_EN,"antivirus_up_to_date":$AV_UPD,"firewall_enabled":$FW_ENABLED,"disk_encryption_enabled":$DISK_ENC,"disk_encryption_method":"LUKS","screen_lock_enabled":$SCREEN_LOCK,"admin_accounts_count":$ADMIN_COUNT,"local_users_count":$LOCAL_USERS,"open_ports_count":$OPEN_PORTS,"risky_open_ports":$RISKY_JSON,"ssh_enabled":$SSH_EN,"rdp_enabled":false,"audit_logging_enabled":$AUDIT_EN}
 JSON
 }
 
@@ -507,7 +654,7 @@ apply_interval() {
     INTERVAL="$NEW_INT"
   fi
   NEW_SEC=$(grep -o '"security_interval":[0-9]*' "$RESP_FILE" 2>/dev/null | head -1 | sed 's/.*://')
-  case "$NEW_SEC" in ''|*[!0-9]*) : ;; *) [ "$NEW_SEC" -ge 300 ] && SEC_INTERVAL="$NEW_SEC" ;; esac
+  case "$NEW_SEC" in ''|*[!0-9]*) : ;; *) [ "$NEW_SEC" -ge 15 ] && SEC_INTERVAL="$NEW_SEC" ;; esac
   # Solicitud manual de auditoría de seguridad desde la plataforma
   if grep -q '"security_now":true' "$RESP_FILE" 2>/dev/null; then SEC_LAST=0; fi
 }
@@ -527,6 +674,14 @@ while true; do
   post_json "$DISKS_URL" "{\"disks\":$DISKS}" >/dev/null 2>&1 || true
   SERVICES=$(collect_services 2>/dev/null || echo "[]")
   post_json "$SERVICES_URL" "{\"services\":$SERVICES}" >/dev/null 2>&1 || true
+  PROG_NOW=$(date +%s)
+  if [ "$((PROG_NOW - PROG_LAST))" -ge "$PROG_INTERVAL" ]; then
+    PROGRAMS=$(collect_programs 2>/dev/null || echo "[]")
+    case "$PROGRAMS" in
+      '[]'|'') : ;;
+      *) if post_json "$PROGRAMS_URL" "{\"programs\":$PROGRAMS}" >/dev/null 2>&1; then PROG_LAST=$PROG_NOW; fi ;;
+    esac
+  fi
 
   NOW_TS=$(date +%s)
   if [ "$((NOW_TS - SEC_LAST))" -ge "$SEC_INTERVAL" ]; then
