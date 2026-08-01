@@ -14,7 +14,7 @@ $p=0;'Ssl3','Tls','Tls11','Tls12','Tls13'|%{try{$p=$p-bor[Net.SecurityProtocolTy
 try { [Net.ServicePointManager]::ServerCertificateValidationCallback = { $true } } catch {}
 $ErrorActionPreference = 'Continue'
 
-$AgentVersion = '2.2.8-windows'
+$AgentVersion = '2.3.1-windows'
 $Token        = if ($env:AGENT_TOKEN) { $env:AGENT_TOKEN } else { $env:TOKEN }
 $Url          = if ($env:INGEST_URL)  { $env:INGEST_URL }  else { $env:URL }
 $Interval     = if ($env:INTERVAL)    { [int]$env:INTERVAL } else { 5 }
@@ -30,6 +30,9 @@ $ShutdownTaskName = 'TorobyteAgentShutdown'
 $SessionsVbsPath  = Join-Path $InstallDir 'torobyte-sessions.vbs'
 $ShutdownPsPath   = Join-Path $InstallDir 'torobyte-shutdown.ps1'
 $ShutdownVbsPath  = Join-Path $InstallDir 'torobyte-shutdown.vbs'
+$LocationRequestPath = Join-Path $InstallDir 'location-requested.flag'
+$LocationFixPath     = Join-Path $InstallDir 'location-user-fix.json'
+$LocationConsentPath = Join-Path $InstallDir 'location-consent.json'
 
 function W-Log($msg) {
   $line = "[$((Get-Date).ToString('o'))] $msg"
@@ -201,14 +204,11 @@ function Get-WifiAps {
 $Script:_geoFix   = $null
 $Script:_geoFixAt = $null
 function Enable-LocationService {
-  # El servicio de ubicacion de Windows debe estar habilitado para que la API
-  # nativa (Wi-Fi + GNSS) entregue coordenadas. Se hace en silencio como SYSTEM.
+  # Habilita el servicio, pero nunca concede el permiso en nombre del usuario.
+  # Windows exige solicitar el consentimiento desde la sesion interactiva.
   try {
     $cfg = 'HKLM:\SYSTEM\CurrentControlSet\Services\lfsvc\Service\Configuration'
     if (Test-Path $cfg) { New-ItemProperty -Path $cfg -Name 'Status' -Value 1 -PropertyType DWord -Force | Out-Null }
-    $consent = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore\location'
-    if (-not (Test-Path $consent)) { New-Item -Path $consent -Force | Out-Null }
-    New-ItemProperty -Path $consent -Name 'Value' -Value 'Allow' -PropertyType String -Force | Out-Null
     $svc = Get-Service -Name lfsvc -ErrorAction SilentlyContinue
     if ($svc -and $svc.Status -ne 'Running') {
       Set-Service -Name lfsvc -StartupType Automatic -ErrorAction SilentlyContinue
@@ -216,6 +216,68 @@ function Enable-LocationService {
     }
   } catch {}
 }
+
+function Get-UserGeoFix {
+  try {
+    if (-not (Test-Path $LocationFixPath)) { return $null }
+    $item = Get-Item $LocationFixPath -ErrorAction Stop
+    if (((Get-Date) - $item.LastWriteTime).TotalMinutes -gt 15) { return $null }
+    $saved = Get-Content $LocationFixPath -Raw -ErrorAction Stop | ConvertFrom-Json
+    if ($saved -and $saved.lat -ne $null -and $saved.lon -ne $null) { return $saved }
+  } catch {}
+  return $null
+}
+
+function Set-GpsConsent {
+  param([string]$State, [string]$Reason)
+  try {
+    @{ state = $State; reason = $Reason; at = (Get-Date).ToString('o') } |
+      ConvertTo-Json -Compress | Set-Content -Encoding UTF8 -Path $LocationConsentPath
+  } catch {}
+}
+
+function Get-GpsConsent {
+  try {
+    if (-not (Test-Path $LocationConsentPath)) { return $null }
+    return (Get-Content $LocationConsentPath -Raw -ErrorAction Stop | ConvertFrom-Json)
+  } catch { return $null }
+}
+
+function Request-UserLocationConsent {
+  # Corre en TorobyteAgentSessions, dentro del escritorio del usuario.
+  # RequestAccessAsync muestra el dialogo oficial que SYSTEM no puede abrir.
+  if (-not (Test-Path $LocationRequestPath)) { return }
+  try {
+    Add-Type -AssemblyName System.Runtime.WindowsRuntime -ErrorAction SilentlyContinue
+    Set-GpsConsent 'pending' 'Solicitud de autorizacion mostrada al usuario'
+    $accessOp = [Windows.Devices.Geolocation.Geolocator]::RequestAccessAsync()
+    $wait = [Diagnostics.Stopwatch]::StartNew()
+    while ($accessOp.Status -eq 0 -and $wait.Elapsed.TotalSeconds -lt 60) { Start-Sleep -Milliseconds 250 }
+    if ($accessOp.Status -ne 1) {
+      Set-GpsConsent 'pending' 'El usuario no respondio al dialogo de ubicacion'
+      return
+    }
+    $access = $accessOp.GetResults()
+    if ("$access" -notmatch '(?i)Allowed') {
+      Set-GpsConsent 'denied' "El usuario rechazo el acceso a ubicacion ($access)"
+      try { Start-Process 'ms-settings:privacy-location' | Out-Null } catch {}
+      return
+    }
+    Set-GpsConsent 'granted' 'El usuario autorizo el acceso a ubicacion'
+    $Script:_geoFix = $null; $Script:_geoFixAt = $null
+    $fix = Get-NativeGeo
+    if ($fix) {
+      @{ lat = $fix.lat; lon = $fix.lon; acc = $fix.acc; src = $fix.src; captured_at = (Get-Date).ToString('o') } |
+        ConvertTo-Json -Compress | Set-Content -Encoding UTF8 -Path $LocationFixPath
+      Remove-Item $LocationRequestPath -Force -ErrorAction SilentlyContinue
+      W-Log 'ubicacion nativa autorizada y capturada en sesion de usuario'
+    }
+  } catch {
+    Set-GpsConsent 'pending' "Solicitud pendiente: $($_.Exception.Message)"
+    W-Log "solicitud de ubicacion al usuario pendiente: $($_.Exception.Message)"
+  }
+}
+
 
 function Get-NativeGeo {
   # Ubicacion nativa de Windows (GNSS si existe, si no trilateracion Wi-Fi del
@@ -457,7 +519,9 @@ function Collect-Metrics {
     if ($bios -and $bios.SerialNumber) { $serialNumber = ($bios.SerialNumber -replace '\s+', ' ').Trim() }
   } catch {}
 
-  $geoFix = Get-NativeGeo
+  $geoFix = Get-UserGeoFix
+  if (-not $geoFix) { $geoFix = Get-NativeGeo }
+  $gpsConsent = Get-GpsConsent
 
   [pscustomobject]@{
     hostname      = $env:COMPUTERNAME
@@ -474,6 +538,8 @@ function Collect-Metrics {
     longitude     = $(if ($geoFix) { $geoFix.lon } else { $null })
     location_accuracy_m = $(if ($geoFix) { $geoFix.acc } else { $null })
     location_source     = $(if ($geoFix) { $geoFix.src } else { $null })
+    gps_consent         = $(if ($gpsConsent -and $gpsConsent.state) { "$($gpsConsent.state)" } else { 'pending' })
+    gps_consent_reason  = $(if ($gpsConsent -and $gpsConsent.reason) { "$($gpsConsent.reason)" } else { 'Autorizacion de ubicacion aun no solicitada al usuario' })
 
 
 
@@ -1681,6 +1747,12 @@ function Run-AgentLoop {
             $Script:_secLastAt = [DateTime]::MinValue
           }
         } catch {}
+        try {
+          if ($resp.location_now -eq $true -or $resp.request_gps_consent -eq $true) {
+            New-Item -ItemType File -Path $LocationRequestPath -Force | Out-Null
+            W-Log 'solicitud de autorizacion GPS pendiente para el usuario'
+          }
+        } catch {}
       } else {
         W-Log 'metrics failed'
       }
@@ -1847,6 +1919,7 @@ function Install-Agent {
     ('sh.Run "powershell.exe -NoLogo -NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File ""' + $ScriptPath + '""", 0, False')
   )
   Set-Content -Encoding ASCII -Path $SessionsVbsPath -Value $vbsLines
+  New-Item -ItemType File -Path $LocationRequestPath -Force | Out-Null
   $sessionsXml = @"
 <?xml version="1.0" encoding="UTF-16"?>
 <Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
@@ -2007,8 +2080,10 @@ function Run-SessionsLoop {
     $Script:_stateFile = Join-Path $userStateRoot ("agent-state-{0}.json" -f ([Environment]::UserName).ToLowerInvariant())
   } catch {}
   W-Log "torobyte-agent sessions loop $AgentVersion interval=$Interval user=$([Environment]::UserName)"
+  Request-UserLocationConsent
   Load-AgentState
   while ($true) {
+    Request-UserLocationConsent
     try {
       $slept = 0
       $step = $Script:_sessionSampleSec
