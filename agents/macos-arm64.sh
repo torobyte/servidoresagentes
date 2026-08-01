@@ -7,7 +7,7 @@ AGENT_TOKEN="${AGENT_TOKEN:-${TOKEN:-}}"
 INGEST_URL="${INGEST_URL:-${URL:-}}"
 INTERVAL="${INTERVAL:-5}"
 ONCE="${ONCE:-0}"
-AGENT_VERSION="2.3.1-macos-arm64"
+AGENT_VERSION="2.3.2-macos-arm64"
 MODE="${1:-run}"
 
 INSTALL_DIR="/usr/local/torobyte-agent"
@@ -169,16 +169,25 @@ location_services_enabled() {
   [ "$v" = "1" ]
 }
 gps_consent_state() {
+  if [ -f "$LOCATION_CONSENT_STATE" ]; then cat "$LOCATION_CONSENT_STATE"; return 0; fi
   if location_services_enabled; then
     printf 'granted|Servicios de localizacion activos y autorizados en el equipo'
     return 0
   fi
-  if [ -f "$LOCATION_CONSENT_STATE" ]; then cat "$LOCATION_CONSENT_STATE"; return 0; fi
   printf 'pending|Autorizacion de ubicacion aun no solicitada al usuario'
+}
+enable_location_services() {
+  # Solo posible como root: activa el interruptor global de Localizacion.
+  plist=/var/db/locationd/Library/Preferences/ByHost/com.apple.locationd
+  defaults write "$plist" LocationServicesEnabled -bool true >/dev/null 2>&1 || true
+  chown -R _locationd:_locationd /var/db/locationd >/dev/null 2>&1 || true
+  killall locationd >/dev/null 2>&1 || true
 }
 request_location_consent() {
   # macOS no trae GPS/GNSS; Core Location usa normalmente Wi-Fi. El permiso
-  # solo puede solicitarse en la sesion grafica del usuario.
+  # solo puede solicitarse en la sesion grafica del usuario, con un cuadro
+  # inmediato de Permitir / No permitir (el daemon de fondo no aparece en la
+  # lista de Localizacion de Ajustes, por eso pedimos el consentimiento aqui).
   [ -f "$LOCATION_CONSENT_MARKER" ] && return 0
   cu=$(stat -f '%Su' /dev/console 2>/dev/null || true)
   [ -n "$cu" ] && [ "$cu" != "root" ] && [ "$cu" != "loginwindow" ] || return 0
@@ -186,20 +195,25 @@ request_location_consent() {
   [ -n "$uid" ] || return 0
   set_gps_consent "pending" "Solicitud de autorizacion mostrada al usuario"
   ans=$(launchctl asuser "$uid" sudo -u "$cu" osascript \
-    -e 'display dialog "Torobyte Monitor necesita que autorices Localizacion para obtener la ubicacion precisa de este Mac mediante Core Location y redes Wi-Fi cercanas. Puedes cambiar este permiso posteriormente en Privacidad y seguridad." with title "Permiso de ubicacion" buttons {"Ahora no", "Abrir configuracion"} default button "Abrir configuracion" with icon caution' \
+    -e 'display dialog "Torobyte Monitor solicita autorizacion para registrar la ubicacion de este Mac (Wi-Fi cercano y red) con fines de inventario y recuperacion ante robo. ¿Permites el acceso a la ubicacion?" with title "Permiso de ubicacion" buttons {"No permitir", "Permitir"} default button "Permitir" with icon caution giving up after 120' \
     -e 'button returned of result' 2>/dev/null || true)
   case "$ans" in
-    *Abrir*)
-      launchctl asuser "$uid" sudo -u "$cu" osascript -e 'open location "x-apple.systempreferences:com.apple.preference.security?Privacy_LocationServices"' >/dev/null 2>&1 || true
-      set_gps_consent "pending" "El usuario abrio Privacidad y seguridad; falta activar Localizacion" ;;
-    *Ahora*)
+    *"No permitir"*)
       set_gps_consent "denied" "El usuario rechazo autorizar la ubicacion" ;;
+    *Permitir*)
+      set_gps_consent "granted" "El usuario autorizo la ubicacion en el cuadro del agente"
+      enable_location_services
+      if location_services_enabled; then
+        set_gps_consent "granted" "Autorizado por el usuario; servicios de localizacion activos"
+      else
+        set_gps_consent "granted" "Autorizado por el usuario; se ubica por Wi-Fi (macOS no lista daemons en Localizacion)"
+      fi ;;
     *)
       set_gps_consent "pending" "El usuario no respondio al dialogo de ubicacion" ;;
   esac
-  if location_services_enabled; then set_gps_consent "granted" "Servicios de localizacion activados por el usuario"; fi
   touch "$LOCATION_CONSENT_MARKER" 2>/dev/null || true
 }
+
 safe_number() { awk -v v="${1:-0}" 'BEGIN{if (v ~ /^-?[0-9]+([.][0-9]+)?$/) printf "%s", v+0; else printf "0"}'; }
 safe_int()    { awk -v v="${1:-0}" 'BEGIN{if (v ~ /^[0-9]+$/) printf "%d", v; else printf "0"}'; }
 now_iso()     { date -u +"%Y-%m-%dT%H:%M:%SZ"; }
