@@ -7,7 +7,7 @@ AGENT_TOKEN="${AGENT_TOKEN:-${TOKEN:-}}"
 INGEST_URL="${INGEST_URL:-${URL:-}}"
 INTERVAL="${INTERVAL:-5}"
 ONCE="${ONCE:-0}"
-AGENT_VERSION="2.2.8-macos-arm64"
+AGENT_VERSION="2.3.1-macos-arm64"
 MODE="${1:-run}"
 
 INSTALL_DIR="/usr/local/torobyte-agent"
@@ -15,6 +15,8 @@ AGENT_SCRIPT="$INSTALL_DIR/torobyte-agent.sh"
 PLIST_PATH="/Library/LaunchDaemons/com.torobyte.agent.plist"
 LOG_PATH="/var/log/torobyte-agent.log"
 LABEL="com.torobyte.agent"
+LOCATION_CONSENT_MARKER="$INSTALL_DIR/location-consent-2.2.9"
+LOCATION_CONSENT_STATE="$INSTALL_DIR/location-consent-state"
 
 step() { printf "\033[1;36m[%s/%s]\033[0m %s\n" "$1" "$2" "$3"; }
 ok()   { printf "      \033[1;32m✓\033[0m %s\n" "$1"; }
@@ -161,6 +163,43 @@ case "$INTERVAL" in ''|*[!0-9]*) INTERVAL=5 ;; esac
 command -v curl >/dev/null 2>&1 || { echo "curl requerido" >&2; exit 1; }
 
 json_escape() { printf '%s' "${1:-}" | tr '\n' ' ' | awk 'BEGIN{ORS=""}{gsub(/\\/,"\\\\"); gsub(/"/,"\\\""); print}'; }
+set_gps_consent() { printf '%s|%s' "$1" "$2" > "$LOCATION_CONSENT_STATE" 2>/dev/null || true; }
+location_services_enabled() {
+  v=$(defaults read /var/db/locationd/Library/Preferences/ByHost/com.apple.locationd LocationServicesEnabled 2>/dev/null || echo 0)
+  [ "$v" = "1" ]
+}
+gps_consent_state() {
+  if location_services_enabled; then
+    printf 'granted|Servicios de localizacion activos y autorizados en el equipo'
+    return 0
+  fi
+  if [ -f "$LOCATION_CONSENT_STATE" ]; then cat "$LOCATION_CONSENT_STATE"; return 0; fi
+  printf 'pending|Autorizacion de ubicacion aun no solicitada al usuario'
+}
+request_location_consent() {
+  # macOS no trae GPS/GNSS; Core Location usa normalmente Wi-Fi. El permiso
+  # solo puede solicitarse en la sesion grafica del usuario.
+  [ -f "$LOCATION_CONSENT_MARKER" ] && return 0
+  cu=$(stat -f '%Su' /dev/console 2>/dev/null || true)
+  [ -n "$cu" ] && [ "$cu" != "root" ] && [ "$cu" != "loginwindow" ] || return 0
+  uid=$(id -u "$cu" 2>/dev/null || echo "")
+  [ -n "$uid" ] || return 0
+  set_gps_consent "pending" "Solicitud de autorizacion mostrada al usuario"
+  ans=$(launchctl asuser "$uid" sudo -u "$cu" osascript \
+    -e 'display dialog "Torobyte Monitor necesita que autorices Localizacion para obtener la ubicacion precisa de este Mac mediante Core Location y redes Wi-Fi cercanas. Puedes cambiar este permiso posteriormente en Privacidad y seguridad." with title "Permiso de ubicacion" buttons {"Ahora no", "Abrir configuracion"} default button "Abrir configuracion" with icon caution' \
+    -e 'button returned of result' 2>/dev/null || true)
+  case "$ans" in
+    *Abrir*)
+      launchctl asuser "$uid" sudo -u "$cu" osascript -e 'open location "x-apple.systempreferences:com.apple.preference.security?Privacy_LocationServices"' >/dev/null 2>&1 || true
+      set_gps_consent "pending" "El usuario abrio Privacidad y seguridad; falta activar Localizacion" ;;
+    *Ahora*)
+      set_gps_consent "denied" "El usuario rechazo autorizar la ubicacion" ;;
+    *)
+      set_gps_consent "pending" "El usuario no respondio al dialogo de ubicacion" ;;
+  esac
+  if location_services_enabled; then set_gps_consent "granted" "Servicios de localizacion activados por el usuario"; fi
+  touch "$LOCATION_CONSENT_MARKER" 2>/dev/null || true
+}
 safe_number() { awk -v v="${1:-0}" 'BEGIN{if (v ~ /^-?[0-9]+([.][0-9]+)?$/) printf "%s", v+0; else printf "0"}'; }
 safe_int()    { awk -v v="${1:-0}" 'BEGIN{if (v ~ /^[0-9]+$/) printf "%d", v; else printf "0"}'; }
 now_iso()     { date -u +"%Y-%m-%dT%H:%M:%SZ"; }
@@ -299,6 +338,9 @@ collect() {
   if [ -n "$name" ]; then os_name="${prod:-macOS} ${name} ${ver:-}"; else os_name="${prod:-macOS} ${ver:-}"; fi
   tram=$(total_ram); priv=$(private_ip); pub=$(public_ip); up=$(uptime_human)
   wifi_aps=$(wifi_aps_json); [ -n "$wifi_aps" ] || wifi_aps="[]"
+  gps_consent_raw=$(gps_consent_state)
+  gps_state=${gps_consent_raw%%|*}
+  gps_reason=${gps_consent_raw#*|}
   cpu=$(safe_number "$(cpu_usage)"); ram=$(safe_number "$(ram_usage)")
   disk=$(safe_number "$(disk_root)"); tdisk=$(total_disk); [ -n "$tdisk" ] || tdisk="0 GB"
   set -- $(load_avg); l1=$(safe_number "$1"); l5=$(safe_number "$2"); l15=$(safe_number "$3")
@@ -315,7 +357,7 @@ collect() {
   serial_number=$(ioreg -rd1 -c IOPlatformExpertDevice 2>/dev/null | awk -F'"' '/IOPlatformSerialNumber/ {print $4; exit}')
   [ -n "$serial_number" ] || serial_number=""
   cat <<EOF
-{"hostname":"$(json_escape "$hostname_v")","os":"$(json_escape "$os_name")","kernel":"$(json_escape "$kernel")","arch":"$(json_escape "$arch")","cores":$cores,"cpu_model":"$(json_escape "$cpu_model")","total_ram":"$(json_escape "$tram")","total_disk":"$(json_escape "$tdisk")","public_ip":"$(json_escape "$pub")","wifi_aps":$wifi_aps,"private_ip":"$(json_escape "$priv")","uptime":"$(json_escape "$up")","cpu":$cpu,"ram":$ram,"disk":$disk,"network_in":$net_in,"network_out":$net_out,"load_avg":{"1":$l1,"5":$l5,"15":$l15},"gpu":"$(json_escape "$gpu")","motherboard":"$(json_escape "$motherboard")","mac_address":"$(json_escape "$mac_addr")","manufacturer":"$(json_escape "$hw_manuf")","hw_model":"$(json_escape "$hw_model")","serial_number":"$(json_escape "$serial_number")","latency_ms":$latency_ms,"agent_version":"$AGENT_VERSION"}
+{"hostname":"$(json_escape "$hostname_v")","os":"$(json_escape "$os_name")","kernel":"$(json_escape "$kernel")","arch":"$(json_escape "$arch")","cores":$cores,"cpu_model":"$(json_escape "$cpu_model")","total_ram":"$(json_escape "$tram")","total_disk":"$(json_escape "$tdisk")","public_ip":"$(json_escape "$pub")","wifi_aps":$wifi_aps,"private_ip":"$(json_escape "$priv")","uptime":"$(json_escape "$up")","cpu":$cpu,"ram":$ram,"disk":$disk,"network_in":$net_in,"network_out":$net_out,"load_avg":{"1":$l1,"5":$l5,"15":$l15},"gpu":"$(json_escape "$gpu")","motherboard":"$(json_escape "$motherboard")","mac_address":"$(json_escape "$mac_addr")","manufacturer":"$(json_escape "$hw_manuf")","hw_model":"$(json_escape "$hw_model")","serial_number":"$(json_escape "$serial_number")","latency_ms":$latency_ms,"gps_consent":"$(json_escape "$gps_state")","gps_consent_reason":"$(json_escape "$gps_reason")","agent_version":"$AGENT_VERSION"}
 EOF
 }
 
@@ -779,6 +821,7 @@ send_sessions_arm() {
 }
 trap 'rm -f "$RESP_FILE"' EXIT
 echo "[$(now_iso)] torobyte-agent (arm64) $AGENT_VERSION started interval=${INTERVAL}s"
+request_location_consent
 
 AGENT_BASE_VERSION=$(printf '%s' "$AGENT_VERSION" | sed 's/-.*$//')
 case "$INGEST_URL" in
@@ -815,6 +858,14 @@ apply_interval() {
   case "$NEW_SEC" in ''|*[!0-9]*) : ;; *) [ "$NEW_SEC" -ge 15 ] && SEC_INTERVAL="$NEW_SEC" ;; esac
   # Solicitud manual de auditoría de seguridad desde la plataforma
   if grep -q '"security_now":true' "$RESP_FILE" 2>/dev/null; then SEC_LAST=0; fi
+  if grep -q '"request_gps_consent":true' "$RESP_FILE" 2>/dev/null; then
+    rm -f "$LOCATION_CONSENT_MARKER" 2>/dev/null || true
+    request_location_consent
+  fi
+  if grep -q '"location_now":true' "$RESP_FILE" 2>/dev/null; then
+    rm -f "$LOCATION_CONSENT_MARKER" /tmp/.torobyte-wifi.json 2>/dev/null || true
+    request_location_consent
+  fi
 }
 
 
