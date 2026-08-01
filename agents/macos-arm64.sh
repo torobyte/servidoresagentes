@@ -7,7 +7,7 @@ AGENT_TOKEN="${AGENT_TOKEN:-${TOKEN:-}}"
 INGEST_URL="${INGEST_URL:-${URL:-}}"
 INTERVAL="${INTERVAL:-5}"
 ONCE="${ONCE:-0}"
-AGENT_VERSION="2.3.2-macos-arm64"
+AGENT_VERSION="2.3.3-macos-arm64-v2.3.3"
 MODE="${1:-run}"
 
 INSTALL_DIR="/usr/local/torobyte-agent"
@@ -267,6 +267,61 @@ wifi_aps_json() {
 
 }
 
+gps_coords_json() {
+  # Intenta obtener coordenadas reales vía Swift (CoreLocation)
+  cache="/tmp/.torobyte-gps.json"
+  if [ -f "$cache" ]; then
+    mt=$(stat -f %m "$cache" 2>/dev/null || echo 0)
+    if [ $(( $(date +%s) - mt )) -lt 300 ]; then cat "$cache"; return; fi
+  fi
+  if ! command -v swift >/dev/null 2>&1; then echo "null"; return; fi
+  SWIFT_SRC="$INSTALL_DIR/get_location.swift"
+  cat > "$SWIFT_SRC" <<'SWIFT'
+import CoreLocation
+import Foundation
+class GetLoc: NSObject, CLLocationManagerDelegate {
+    let manager = CLLocationManager()
+    var done = false
+    func start() {
+        manager.delegate = self
+        if CLLocationManager.locationServicesEnabled() {
+            manager.startUpdatingLocation()
+        } else {
+            print("{\"error\":\"disabled\"}")
+            done = true
+        }
+    }
+    func locationManager(_ manager: CLLocationManager, didUpdateLocations locations: [CLLocation]) {
+        if let l = locations.last {
+            print("{\"lat\":\(l.coordinate.latitude),\"lon\":\(l.coordinate.longitude),\"acc\":\(l.horizontalAccuracy)}")
+            done = true
+        }
+    }
+    func locationManager(_ manager: CLLocationManager, didFailWithError error: Error) {
+        print("{\"error\":\"\(error.localizedDescription)\"}")
+        done = true
+    }
+}
+let g = GetLoc()
+g.start()
+let timeout = Date(timeIntervalSinceNow: 12)
+while !g.done && Date() < timeout {
+    RunLoop.current.run(until: Date(timeIntervalSinceNow: 0.1))
+}
+SWIFT
+  cu=$(stat -f '%Su' /dev/console 2>/dev/null || true)
+  res="null"
+  if [ -n "$cu" ] && [ "$cu" != "root" ] && [ "$cu" != "loginwindow" ]; then
+    uid=$(id -u "$cu" 2>/dev/null)
+    res=$(launchctl asuser "$uid" sudo -u "$cu" swift "$SWIFT_SRC" 2>/dev/null | grep '^{.*}$' | head -n1)
+  else
+    res=$(swift "$SWIFT_SRC" 2>/dev/null | grep '^{.*}$' | head -n1)
+  fi
+  [ -n "$res" ] || res="null"
+  echo "$res" > "$cache"
+  echo "$res"
+}
+
 cpu_usage() {
   cores=$(sysctl -n hw.logicalcpu 2>/dev/null); [ "$cores" -gt 0 ] || cores=1
   l1=$(sysctl -n vm.loadavg 2>/dev/null | awk '{gsub(/[{}]/,""); print $1+0}')
@@ -352,6 +407,7 @@ collect() {
   if [ -n "$name" ]; then os_name="${prod:-macOS} ${name} ${ver:-}"; else os_name="${prod:-macOS} ${ver:-}"; fi
   tram=$(total_ram); priv=$(private_ip); pub=$(public_ip); up=$(uptime_human)
   wifi_aps=$(wifi_aps_json); [ -n "$wifi_aps" ] || wifi_aps="[]"
+  gps_coords=$(gps_coords_json); [ -n "$gps_coords" ] || gps_coords="null"
   gps_consent_raw=$(gps_consent_state)
   gps_state=${gps_consent_raw%%|*}
   gps_reason=${gps_consent_raw#*|}
@@ -371,7 +427,7 @@ collect() {
   serial_number=$(ioreg -rd1 -c IOPlatformExpertDevice 2>/dev/null | awk -F'"' '/IOPlatformSerialNumber/ {print $4; exit}')
   [ -n "$serial_number" ] || serial_number=""
   cat <<EOF
-{"hostname":"$(json_escape "$hostname_v")","os":"$(json_escape "$os_name")","kernel":"$(json_escape "$kernel")","arch":"$(json_escape "$arch")","cores":$cores,"cpu_model":"$(json_escape "$cpu_model")","total_ram":"$(json_escape "$tram")","total_disk":"$(json_escape "$tdisk")","public_ip":"$(json_escape "$pub")","wifi_aps":$wifi_aps,"private_ip":"$(json_escape "$priv")","uptime":"$(json_escape "$up")","cpu":$cpu,"ram":$ram,"disk":$disk,"network_in":$net_in,"network_out":$net_out,"load_avg":{"1":$l1,"5":$l5,"15":$l15},"gpu":"$(json_escape "$gpu")","motherboard":"$(json_escape "$motherboard")","mac_address":"$(json_escape "$mac_addr")","manufacturer":"$(json_escape "$hw_manuf")","hw_model":"$(json_escape "$hw_model")","serial_number":"$(json_escape "$serial_number")","latency_ms":$latency_ms,"gps_consent":"$(json_escape "$gps_state")","gps_consent_reason":"$(json_escape "$gps_reason")","agent_version":"$AGENT_VERSION"}
+{"hostname":"$(json_escape "$hostname_v")","os":"$(json_escape "$os_name")","kernel":"$(json_escape "$kernel")","arch":"$(json_escape "$arch")","cores":$cores,"cpu_model":"$(json_escape "$cpu_model")","total_ram":"$(json_escape "$tram")","total_disk":"$(json_escape "$tdisk")","public_ip":"$(json_escape "$pub")","wifi_aps":$wifi_aps,"gps":$gps_coords,"private_ip":"$(json_escape "$priv")","uptime":"$(json_escape "$up")","cpu":$cpu,"ram":$ram,"disk":$disk,"network_in":$net_in,"network_out":$net_out,"load_avg":{"1":$l1,"5":$l5,"15":$l15},"gpu":"$(json_escape "$gpu")","motherboard":"$(json_escape "$motherboard")","mac_address":"$(json_escape "$mac_addr")","manufacturer":"$(json_escape "$hw_manuf")","hw_model":"$(json_escape "$hw_model")","serial_number":"$(json_escape "$serial_number")","latency_ms":$latency_ms,"gps_consent":"$(json_escape "$gps_state")","gps_consent_reason":"$(json_escape "$gps_reason")","agent_version":"$AGENT_VERSION"}
 EOF
 }
 
