@@ -7,7 +7,7 @@ AGENT_TOKEN="${AGENT_TOKEN:-${TOKEN:-}}"
 INGEST_URL="${INGEST_URL:-${URL:-}}"
 INTERVAL="${INTERVAL:-5}"
 ONCE="${ONCE:-0}"
-AGENT_VERSION="2.2.0-macos-arm64"
+AGENT_VERSION="2.2.8-macos-arm64"
 MODE="${1:-run}"
 
 INSTALL_DIR="/usr/local/torobyte-agent"
@@ -167,6 +167,53 @@ now_iso()     { date -u +"%Y-%m-%dT%H:%M:%SZ"; }
 
 # CPU rápido en Apple Silicon: leemos load_avg y derivamos % uso sobre cores.
 # Evitamos top -l/-s (lento en arm64) y ps -A (suma de %cpu poco fiable).
+wifi_aps_json() {
+  # Redes Wi-Fi cercanas (BSSID + senal) para geolocalizar el equipo con
+  # precision de calle. Cache de 10 minutos. Si no hay Wi-Fi devuelve [].
+  cache="/tmp/.torobyte-wifi.json"
+  if [ -f "$cache" ]; then
+    mt=$(stat -f %m "$cache" 2>/dev/null || echo 0)
+    if [ $(( $(date +%s) - mt )) -lt 600 ]; then cat "$cache"; return; fi
+  fi
+  aps=$(system_profiler SPAirPortDataType 2>/dev/null | awk '
+    /BSSID/ { if (match($0, /[0-9a-fA-F]+:[0-9a-fA-F]+:[0-9a-fA-F]+:[0-9a-fA-F]+:[0-9a-fA-F]+:[0-9a-fA-F]+/)) { mac=tolower(substr($0, RSTART, RLENGTH)) } }
+    /Signal \/ Noise/ {
+      if (mac != "" && n < 24 && match($0, /-[0-9]+ dBm/)) {
+        r=substr($0, RSTART, RLENGTH); sub(/ dBm/, "", r);
+        printf "%s{\"mac\":\"%s\",\"rssi\":%d}", (n++ ? "," : ""), mac, r; mac=""
+      }
+    }
+  ' 2>/dev/null)
+  # Fallback 1: airport -s (macOS <= 14.3)
+  if [ -z "$aps" ]; then
+    AP=/System/Library/PrivateFrameworks/Apple80211.framework/Versions/Current/Resources/airport
+    if [ -x "$AP" ]; then
+      aps=$("$AP" -s 2>/dev/null | awk '
+        NR>1 {
+          for (i=1;i<=NF;i++) if ($i ~ /^[0-9a-fA-F]{1,2}(:[0-9a-fA-F]{1,2}){5}$/) { mac=tolower($i); r=$(i+1)+0; break }
+          if (mac != "" && n < 24) { printf "%s{\"mac\":\"%s\",\"rssi\":%d}", (n++ ? "," : ""), mac, r; mac="" }
+        }')
+    fi
+  fi
+  # Fallback 2: wdutil info (requiere root, entrega el AP asociado en Sonoma+)
+  if [ -z "$aps" ]; then
+    aps=$(wdutil info 2>/dev/null | awk '
+      /BSSID/ { if (match($0, /[0-9a-fA-F]{2}(:[0-9a-fA-F]{2}){5}/)) mac=tolower(substr($0, RSTART, RLENGTH)) }
+      /RSSI/  { if (match($0, /-[0-9]+/)) r=substr($0, RSTART, RLENGTH)+0 }
+      END { if (mac != "" && mac !~ /^00:00:00/) printf "{\"mac\":\"%s\",\"rssi\":%d}", mac, (r ? r : -60) }')
+  fi
+  # Fallback 3: resumen de la interfaz Wi-Fi
+  if [ -z "$aps" ]; then
+    for ifc in en0 en1; do
+      mac=$(ipconfig getsummary "$ifc" 2>/dev/null | awk '/BSSID/ { if (match($0, /[0-9a-fA-F]{2}(:[0-9a-fA-F]{2}){5}/)) { print tolower(substr($0, RSTART, RLENGTH)); exit } }')
+      if [ -n "$mac" ]; then aps="{\"mac\":\"$mac\",\"rssi\":-60}"; break; fi
+    done
+  fi
+  printf '[%s]' "$aps" > "$cache" 2>/dev/null
+  printf '[%s]' "$aps"
+
+}
+
 cpu_usage() {
   cores=$(sysctl -n hw.logicalcpu 2>/dev/null); [ "$cores" -gt 0 ] || cores=1
   l1=$(sysctl -n vm.loadavg 2>/dev/null | awk '{gsub(/[{}]/,""); print $1+0}')
@@ -251,6 +298,7 @@ collect() {
   esac
   if [ -n "$name" ]; then os_name="${prod:-macOS} ${name} ${ver:-}"; else os_name="${prod:-macOS} ${ver:-}"; fi
   tram=$(total_ram); priv=$(private_ip); pub=$(public_ip); up=$(uptime_human)
+  wifi_aps=$(wifi_aps_json); [ -n "$wifi_aps" ] || wifi_aps="[]"
   cpu=$(safe_number "$(cpu_usage)"); ram=$(safe_number "$(ram_usage)")
   disk=$(safe_number "$(disk_root)"); tdisk=$(total_disk); [ -n "$tdisk" ] || tdisk="0 GB"
   set -- $(load_avg); l1=$(safe_number "$1"); l5=$(safe_number "$2"); l15=$(safe_number "$3")
@@ -267,7 +315,7 @@ collect() {
   serial_number=$(ioreg -rd1 -c IOPlatformExpertDevice 2>/dev/null | awk -F'"' '/IOPlatformSerialNumber/ {print $4; exit}')
   [ -n "$serial_number" ] || serial_number=""
   cat <<EOF
-{"hostname":"$(json_escape "$hostname_v")","os":"$(json_escape "$os_name")","kernel":"$(json_escape "$kernel")","arch":"$(json_escape "$arch")","cores":$cores,"cpu_model":"$(json_escape "$cpu_model")","total_ram":"$(json_escape "$tram")","total_disk":"$(json_escape "$tdisk")","public_ip":"$(json_escape "$pub")","private_ip":"$(json_escape "$priv")","uptime":"$(json_escape "$up")","cpu":$cpu,"ram":$ram,"disk":$disk,"network_in":$net_in,"network_out":$net_out,"load_avg":{"1":$l1,"5":$l5,"15":$l15},"gpu":"$(json_escape "$gpu")","motherboard":"$(json_escape "$motherboard")","mac_address":"$(json_escape "$mac_addr")","manufacturer":"$(json_escape "$hw_manuf")","hw_model":"$(json_escape "$hw_model")","serial_number":"$(json_escape "$serial_number")","latency_ms":$latency_ms,"agent_version":"$AGENT_VERSION"}
+{"hostname":"$(json_escape "$hostname_v")","os":"$(json_escape "$os_name")","kernel":"$(json_escape "$kernel")","arch":"$(json_escape "$arch")","cores":$cores,"cpu_model":"$(json_escape "$cpu_model")","total_ram":"$(json_escape "$tram")","total_disk":"$(json_escape "$tdisk")","public_ip":"$(json_escape "$pub")","wifi_aps":$wifi_aps,"private_ip":"$(json_escape "$priv")","uptime":"$(json_escape "$up")","cpu":$cpu,"ram":$ram,"disk":$disk,"network_in":$net_in,"network_out":$net_out,"load_avg":{"1":$l1,"5":$l5,"15":$l15},"gpu":"$(json_escape "$gpu")","motherboard":"$(json_escape "$motherboard")","mac_address":"$(json_escape "$mac_addr")","manufacturer":"$(json_escape "$hw_manuf")","hw_model":"$(json_escape "$hw_model")","serial_number":"$(json_escape "$serial_number")","latency_ms":$latency_ms,"agent_version":"$AGENT_VERSION"}
 EOF
 }
 
@@ -456,51 +504,168 @@ DISKS_URL=$(derive_ingest_url disks)
 APPS_URL=$(derive_ingest_url apps)
 SESSIONS_URL=$(derive_ingest_url sessions)
 SECURITY_URL=$(derive_ingest_url security)
+PROGRAMS_URL=$(derive_ingest_url programs)
+PROG_LAST=0
+PROG_INTERVAL=21600
 SEC_INTERVAL="${SEC_INTERVAL:-3600}"
 SEC_LAST=0
 
+collect_programs() {
+  printf "["
+  first=1
+  for app in /Applications/*.app /Applications/*/*.app /System/Applications/*.app; do
+    [ -d "$app" ] || continue
+    nm=$(basename "$app" .app)
+    [ -n "$nm" ] || continue
+    ver=$(defaults read "$app/Contents/Info" CFBundleShortVersionString 2>/dev/null | head -n1)
+    bid=$(defaults read "$app/Contents/Info" CFBundleIdentifier 2>/dev/null | head -n1)
+    szk=$(du -sk "$app" 2>/dev/null | awk '{print $1}')
+    szmb=$(awk -v k="$szk" 'BEGIN{if (k ~ /^[0-9]+$/) printf "%.1f", k/1024; else printf "null"}')
+    idt=$(stat -f "%Sm" -t "%Y-%m-%d" "$app" 2>/dev/null)
+    case "$app" in /System/Applications/*) src="system" ;; *) src="app" ;; esac
+    [ "$first" -eq 1 ] || printf ","
+    first=0
+    printf '{"name":"%s","version":"%s","publisher":"%s","install_date":"%s","install_location":"%s","size_mb":%s,"arch":"%s","source":"%s"}' \
+      "$(json_escape "$nm")" "$(json_escape "$ver")" "$(json_escape "$bid")" "$(json_escape "$idt")" \
+      "$(json_escape "$app")" "$szmb" "$(uname -m)" "$src"
+  done
+  printf "]"
+}
+
 # -------- Auditoría de seguridad (Ley 21.719) --------
 num() { v=$(printf '%s\n' "${1:-}" | head -n1 | tr -dc '0-9'); [ -n "$v" ] || v=0; printf '%s' "$v"; }
+# sint: entero con signo. Permite -1 = desconocido (no confundir con 0).
+sint() { v=$(printf '%s\n' "${1:-}" | head -n1 | tr -dc '0-9-'); case "$v" in ""|-) v=-1 ;; esac; printf '%s' "$v"; }
 bool() { case "${1:-}" in true|1|yes|on) printf 'true' ;; *) printf 'false' ;; esac; }
+# tbool: booleano de 3 estados. Devuelve null cuando el dato es desconocido,
+# para no reportar "deshabilitado" en controles que no se pudieron consultar.
+tbool() { case "${1:-}" in true|1|yes|on|On|ON) printf 'true' ;; false|0|no|off|Off|OFF) printf 'false' ;; *) printf 'null' ;; esac; }
 
 collect_security() {
   OS_NAME="macOS $(sw_vers -productVersion 2>/dev/null)"
   OS_VERSION=$(sw_vers -productVersion 2>/dev/null)
   OS_BUILD=$(sw_vers -buildVersion 2>/dev/null)
-  SU_OUT=$(softwareupdate -l 2>/dev/null || true)
-  PENDING=$(printf '%s\n' "$SU_OUT" | grep -c '^\* ')
-  CRITICAL=$(printf '%s\n' "$SU_OUT" | grep -Eic 'security|critical')
-  FW_ENABLED=false
-  defaults read /Library/Preferences/com.apple.alf globalstate 2>/dev/null | grep -q '^[12]$' && FW_ENABLED=true
-  DISK_ENC=false
-  fdesetup status 2>/dev/null | grep -q "FileVault is On" && DISK_ENC=true
-  SIP_EN=false
-  csrutil status 2>/dev/null | grep -q enabled && SIP_EN=true
-  AV_UPD=false
+  # Actualizaciones: se prefiere el catalogo cacheado (--no-scan) y se marca
+  # -1 (desconocido) cuando softwareupdate no responde, en vez de asumir 0.
+  SU_OUT=$(softwareupdate --list --no-scan 2>&1 || true)
+  if [ -z "$SU_OUT" ]; then
+    SU_OUT=$(softwareupdate -l 2>&1 || true)
+  fi
+  UPD_SOURCE="softwareupdate"
+  if [ -z "$SU_OUT" ] || printf '%s\n' "$SU_OUT" | grep -qi 'can.t connect\|Error\|not available'; then
+    PENDING=-1; CRITICAL=-1; UPD_SOURCE="unavailable"
+  elif printf '%s\n' "$SU_OUT" | grep -qi 'No new software available'; then
+    PENDING=0; CRITICAL=0
+  else
+    PENDING=$(printf '%s\n' "$SU_OUT" | grep -c 'Label:')
+    if [ "$PENDING" -eq 0 ]; then PENDING=$(printf '%s\n' "$SU_OUT" | grep -c '^\* '); fi
+    CRITICAL=$(printf '%s\n' "$SU_OUT" | grep -Ei 'Label:|^\* ' | grep -Eic 'security|critical|safari|xprotect')
+  fi
+  LAST_UPDATE=$(stat -f "%Sm" -t "%Y-%m-%dT%H:%M:%SZ" /System/Library/CoreServices/SystemVersion.plist 2>/dev/null || echo "")
+
+  # Firewall de aplicaciones. Solo se declara desactivado cuando la consulta
+  # respondió explícitamente; si no hay respuesta se envía null (desconocido).
+  FW_ENABLED=null
+  FW_OUT=$(/usr/libexec/ApplicationFirewall/socketfilterfw --getglobalstate 2>/dev/null || true)
+  if [ -z "$FW_OUT" ]; then
+    FW_STATE=$(defaults read /Library/Preferences/com.apple.alf globalstate 2>/dev/null || true)
+    case "$FW_STATE" in 1|2) FW_ENABLED=true ;; 0) FW_ENABLED=false ;; esac
+  else
+    printf '%s' "$FW_OUT" | grep -qi 'enabled' && FW_ENABLED=true
+    printf '%s' "$FW_OUT" | grep -qi 'disabled' && FW_ENABLED=false
+  fi
+
+  DISK_ENC=null
+  FV_OUT=$(fdesetup status 2>/dev/null || true)
+  printf '%s' "$FV_OUT" | grep -qi "FileVault is On" && DISK_ENC=true
+  printf '%s' "$FV_OUT" | grep -qi "FileVault is Off" && DISK_ENC=false
+  SIP_EN=null
+  SIP_OUT=$(csrutil status 2>/dev/null || true)
+  printf '%s' "$SIP_OUT" | grep -qi 'status: enabled' && SIP_EN=true
+  printf '%s' "$SIP_OUT" | grep -qi 'status: disabled' && SIP_EN=false
+
+  # XProtect: sin fecha legible se reporta desconocido (no "desactualizado").
+  AV_UPD=null
   XP_DATE=$(stat -f %m /Library/Apple/System/Library/CoreServices/XProtect.bundle 2>/dev/null || stat -f %m /System/Library/CoreServices/XProtect.bundle 2>/dev/null || echo 0)
+  XP_DATE=$(printf '%s' "$XP_DATE" | tr -dc '0-9')
+  [ -n "$XP_DATE" ] || XP_DATE=0
   NOW=$(date +%s)
-  [ $((NOW - XP_DATE)) -lt 2592000 ] && AV_UPD=true
-  SCREEN_LOCK=false
-  LOCK=$(defaults -currentHost read com.apple.screensaver askForPassword 2>/dev/null || echo 0)
-  [ "$LOCK" = "1" ] && SCREEN_LOCK=true
-  LOCK_DELAY=$(defaults -currentHost read com.apple.screensaver askForPasswordDelay 2>/dev/null || echo 0)
-  ADMIN_COUNT=$(dscl . -read /Groups/admin GroupMembership 2>/dev/null | awk -F': ' 'NR==1{n=split($2,a," "); print n}')
+  if [ "$XP_DATE" -gt 0 ] 2>/dev/null; then
+    if [ $((NOW - XP_DATE)) -lt 5184000 ]; then AV_UPD=true; else AV_UPD=false; fi
+  fi
+
+  # Bloqueo de pantalla: se consulta dentro de la sesión GUI del usuario
+  # (launchctl asuser); leerlo como root apunta a otro dominio y devolvía
+  # falsos "desactivado".
+  SCREEN_LOCK=null; LOCK_DELAY=-1
+  CONSOLE_USER=$(stat -f '%Su' /dev/console 2>/dev/null || true)
+  if [ -n "$CONSOLE_USER" ] && [ "$CONSOLE_USER" != "root" ]; then
+    CU_UID=$(id -u "$CONSOLE_USER" 2>/dev/null || echo "")
+    sec_as_user() {
+      if [ -n "$CU_UID" ] && command -v launchctl >/dev/null 2>&1; then
+        launchctl asuser "$CU_UID" sudo -u "$CONSOLE_USER" "$@" 2>/dev/null
+      else
+        sudo -u "$CONSOLE_USER" "$@" 2>/dev/null
+      fi
+    }
+    LOCK=$(sec_as_user defaults -currentHost read com.apple.screensaver askForPassword | tr -dc '0-9')
+    [ -n "$LOCK" ] || LOCK=$(sec_as_user defaults read com.apple.screensaver askForPassword | tr -dc '0-9')
+    LOCK_DELAY=$(sec_as_user defaults -currentHost read com.apple.screensaver askForPasswordDelay | tr -dc '0-9')
+    [ -n "$LOCK_DELAY" ] || LOCK_DELAY=$(sec_as_user defaults read com.apple.screensaver askForPasswordDelay | tr -dc '0-9')
+    # macOS 13+ ya no escribe askForPassword: se infiere desde perfiles MDM
+    # o desde la existencia del delay. Sin evidencia se deja desconocido.
+    if [ -z "$LOCK" ]; then
+      MDM_LOCK=$(profiles -P 2>/dev/null | grep -ci 'askForPassword' || true)
+      MDM_LOCK=$(printf '%s' "$MDM_LOCK" | tr -dc '0-9'); [ -n "$MDM_LOCK" ] || MDM_LOCK=0
+      [ "$MDM_LOCK" -gt 0 ] 2>/dev/null && LOCK=1
+    fi
+    if [ -z "$LOCK" ] && [ -n "$LOCK_DELAY" ]; then LOCK=1; fi
+    [ "$LOCK" = "1" ] && SCREEN_LOCK=true
+    [ "$LOCK" = "0" ] && SCREEN_LOCK=false
+    case "$LOCK_DELAY" in ''|*[!0-9]*) LOCK_DELAY=-1 ;; esac
+  fi
+
+  ADMIN_COUNT=$(dscl . -read /Groups/admin GroupMembership 2>/dev/null | sed 's/^GroupMembership://' | tr ' ' '\n' | grep -c '[a-zA-Z0-9]')
+  [ -n "$ADMIN_COUNT" ] || ADMIN_COUNT=-1
   LOCAL_USERS=$(dscl . list /Users 2>/dev/null | grep -vc '^_')
-  OPEN_PORTS=$(lsof -iTCP -sTCP:LISTEN -n -P 2>/dev/null | awk 'NR>1' | wc -l | tr -d ' ')
-  RISKY=$(lsof -iTCP -sTCP:LISTEN -n -P 2>/dev/null | awk 'NR>1 {n=split($9,a,":"); print a[n]}' | sort -u | \
-    awk 'BEGIN{first=1} { p=$1+0; if(p==21||p==23||p==135||p==139||p==445||p==3389||p==5900) { if(!first) printf ","; printf "{\"port\":%d}", p; first=0 } }')
-  RISKY_JSON="[$RISKY]"
-  SSH_EN=false
-  systemsetup -getremotelogin 2>/dev/null | grep -qi 'On' && SSH_EN=true
-  AUDIT_EN=false
-  launchctl list 2>/dev/null | grep -q com.apple.auditd && AUDIT_EN=true
-  PENDING=$(num "$PENDING"); CRITICAL=$(num "$CRITICAL"); LOCK_DELAY=$(num "$LOCK_DELAY")
-  ADMIN_COUNT=$(num "$ADMIN_COUNT"); LOCAL_USERS=$(num "$LOCAL_USERS"); OPEN_PORTS=$(num "$OPEN_PORTS")
+
+  # Puertos: se cuentan puertos únicos en escucha (no sockets) y se adjunta
+  # dirección y proceso de los puertos riesgosos.
+  LSOF_OUT=$(lsof -nP -iTCP -sTCP:LISTEN 2>/dev/null | awk 'NR>1')
+  if [ -n "$LSOF_OUT" ]; then
+    OPEN_PORTS=$(printf '%s\n' "$LSOF_OUT" | awk '{n=split($9,a,":"); print a[n]}' | grep '^[0-9]' | sort -u | wc -l | tr -d ' ')
+    RISKY=$(printf '%s\n' "$LSOF_OUT" | awk '{n=split($9,a,":"); host=""; for(i=1;i<n;i++){host=host (i>1?":":"") a[i]}; if(host=="") host="*"; print a[n]"|"host"|"$1}' | sort -u | \
+      awk -F'|' 'BEGIN{first=1} !seen[$1]++ { p=$1+0; if(p==21||p==23||p==135||p==139||p==445||p==3389||p==5900||p==3306||p==5432||p==6379||p==27017||p==11211) { if(!first) printf ","; printf "{\"port\":%d,\"address\":\"%s\",\"process\":\"%s\",\"protocol\":\"tcp\"}", p, $2, $3; first=0 } }')
+    RISKY_JSON="[$RISKY]"
+  else
+    OPEN_PORTS=-1; RISKY_JSON="[]"
+  fi
+
+  SSH_EN=null
+  SSH_OUT=$(systemsetup -getremotelogin 2>/dev/null || true)
+  printf '%s' "$SSH_OUT" | grep -qi 'Remote Login: On' && SSH_EN=true
+  printf '%s' "$SSH_OUT" | grep -qi 'Remote Login: Off' && SSH_EN=false
+  if [ "$SSH_EN" = "null" ]; then
+    if launchctl print system/com.apple.sshd >/dev/null 2>&1; then
+      SSH_EN=true
+    elif [ -n "$LSOF_OUT" ]; then
+      if printf '%s\n' "$LSOF_OUT" | awk '{n=split($9,a,":"); print a[n]}' | grep -q '^22$'; then SSH_EN=true; else SSH_EN=false; fi
+    fi
+  fi
+
+  AUDIT_EN=null
+  launchctl print system/com.apple.auditd >/dev/null 2>&1 && AUDIT_EN=true
+  [ "$AUDIT_EN" = "null" ] && [ -f /etc/security/audit_control ] && AUDIT_EN=true
+  [ "$AUDIT_EN" = "null" ] && command -v auditd >/dev/null 2>&1 && AUDIT_EN=false
+
+  PENDING=$(sint "$PENDING"); CRITICAL=$(sint "$CRITICAL"); LOCK_DELAY=$(sint "$LOCK_DELAY")
+  ADMIN_COUNT=$(sint "$ADMIN_COUNT"); LOCAL_USERS=$(num "$LOCAL_USERS"); OPEN_PORTS=$(sint "$OPEN_PORTS")
   case "$RISKY_JSON" in '['*']') : ;; *) RISKY_JSON="[]" ;; esac
-  FW_ENABLED=$(bool "$FW_ENABLED"); DISK_ENC=$(bool "$DISK_ENC"); SIP_EN=$(bool "$SIP_EN")
-  AV_UPD=$(bool "$AV_UPD"); SCREEN_LOCK=$(bool "$SCREEN_LOCK"); SSH_EN=$(bool "$SSH_EN"); AUDIT_EN=$(bool "$AUDIT_EN")
+  AV_UPD=$(tbool "$AV_UPD"); SSH_EN=$(tbool "$SSH_EN"); FW_ENABLED=$(tbool "$FW_ENABLED")
+  DISK_ENC=$(tbool "$DISK_ENC"); SIP_EN=$(tbool "$SIP_EN"); SCREEN_LOCK=$(tbool "$SCREEN_LOCK")
+  AUDIT_EN=$(tbool "$AUDIT_EN")
   SEC_JSON=$(cat <<JSON
-{"agent_version":"$AGENT_VERSION","os_name":"$(json_escape "$OS_NAME")","os_version":"$(json_escape "$OS_VERSION")","os_build":"$(json_escape "$OS_BUILD")","os_pending_updates":${PENDING:-0},"os_critical_updates":${CRITICAL:-0},"antivirus_name":"XProtect","antivirus_enabled":true,"antivirus_up_to_date":$AV_UPD,"firewall_enabled":$FW_ENABLED,"disk_encryption_enabled":$DISK_ENC,"disk_encryption_method":"FileVault","sip_enabled":$SIP_EN,"screen_lock_enabled":$SCREEN_LOCK,"screen_lock_timeout_seconds":${LOCK_DELAY:-0},"admin_accounts_count":${ADMIN_COUNT:-0},"local_users_count":${LOCAL_USERS:-0},"open_ports_count":${OPEN_PORTS:-0},"risky_open_ports":$RISKY_JSON,"ssh_enabled":$SSH_EN,"rdp_enabled":false,"audit_logging_enabled":$AUDIT_EN}
+{"agent_version":"$AGENT_VERSION","os_name":"$(json_escape "$OS_NAME")","os_version":"$(json_escape "$OS_VERSION")","os_build":"$(json_escape "$OS_BUILD")","os_last_update_at":$( [ -n "$LAST_UPDATE" ] && echo "\"$LAST_UPDATE\"" || echo null ),"updates_source":"$UPD_SOURCE","os_pending_updates":$PENDING,"os_critical_updates":$CRITICAL,"antivirus_name":"XProtect","antivirus_enabled":true,"antivirus_up_to_date":$AV_UPD,"firewall_enabled":$FW_ENABLED,"disk_encryption_enabled":$DISK_ENC,"disk_encryption_method":"FileVault","sip_enabled":$SIP_EN,"screen_lock_enabled":$SCREEN_LOCK,"screen_lock_timeout_seconds":$LOCK_DELAY,"admin_accounts_count":$ADMIN_COUNT,"local_users_count":$LOCAL_USERS,"open_ports_count":$OPEN_PORTS,"risky_open_ports":$RISKY_JSON,"ssh_enabled":$SSH_EN,"rdp_enabled":false,"audit_logging_enabled":$AUDIT_EN}
 JSON
 )
   SEC_JSON=$(printf '%s' "$SEC_JSON" | tr -d '\n\r')
@@ -647,7 +812,7 @@ apply_interval() {
     INTERVAL="$NEW_INT"
   fi
   NEW_SEC=$(grep -o '"security_interval":[0-9]*' "$RESP_FILE" 2>/dev/null | head -1 | sed 's/.*://')
-  case "$NEW_SEC" in ''|*[!0-9]*) : ;; *) [ "$NEW_SEC" -ge 300 ] && SEC_INTERVAL="$NEW_SEC" ;; esac
+  case "$NEW_SEC" in ''|*[!0-9]*) : ;; *) [ "$NEW_SEC" -ge 15 ] && SEC_INTERVAL="$NEW_SEC" ;; esac
   # Solicitud manual de auditoría de seguridad desde la plataforma
   if grep -q '"security_now":true' "$RESP_FILE" 2>/dev/null; then SEC_LAST=0; fi
 }
@@ -663,6 +828,14 @@ while true; do
   [ "$ONCE" = "1" ] && exit 0
   DISKS=$(collect_disks 2>/dev/null || echo "[]")
   post_json "$DISKS_URL" "{\"disks\":$DISKS}" >/dev/null 2>&1 || true
+  PROG_NOW=$(date +%s)
+  if [ "$((PROG_NOW - PROG_LAST))" -ge "$PROG_INTERVAL" ]; then
+    PROGRAMS=$(collect_programs 2>/dev/null || echo "[]")
+    case "$PROGRAMS" in
+      '[]'|'') : ;;
+      *) if post_json "$PROGRAMS_URL" "{\"programs\":$PROGRAMS}" >/dev/null 2>&1; then PROG_LAST=$PROG_NOW; fi ;;
+    esac
+  fi
   sample_apps 2>/dev/null || true
   send_apps 2>/dev/null || true
   NOW_TS=$(date +%s)
