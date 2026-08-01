@@ -14,7 +14,7 @@ $p=0;'Ssl3','Tls','Tls11','Tls12','Tls13'|%{try{$p=$p-bor[Net.SecurityProtocolTy
 try { [Net.ServicePointManager]::ServerCertificateValidationCallback = { $true } } catch {}
 $ErrorActionPreference = 'Continue'
 
-$AgentVersion = '2.2.0-windows'
+$AgentVersion = '2.2.8-windows'
 $Token        = if ($env:AGENT_TOKEN) { $env:AGENT_TOKEN } else { $env:TOKEN }
 $Url          = if ($env:INGEST_URL)  { $env:INGEST_URL }  else { $env:URL }
 $Interval     = if ($env:INTERVAL)    { [int]$env:INTERVAL } else { 5 }
@@ -27,8 +27,9 @@ $LogPath      = Join-Path $InstallDir 'agent.log'
 $TaskName     = 'TorobyteAgent'
 $SessionsTaskName = 'TorobyteAgentSessions'
 $ShutdownTaskName = 'TorobyteAgentShutdown'
-$SessionsCmdPath  = Join-Path $InstallDir 'torobyte-sessions.cmd'
-$ShutdownCmdPath  = Join-Path $InstallDir 'torobyte-shutdown.cmd'
+$SessionsVbsPath  = Join-Path $InstallDir 'torobyte-sessions.vbs'
+$ShutdownPsPath   = Join-Path $InstallDir 'torobyte-shutdown.ps1'
+$ShutdownVbsPath  = Join-Path $InstallDir 'torobyte-shutdown.vbs'
 
 function W-Log($msg) {
   $line = "[$((Get-Date).ToString('o'))] $msg"
@@ -38,6 +39,21 @@ function W-Log($msg) {
 function W-Step($n, $total, $msg) { Write-Host ("[{0}/{1}] {2}" -f $n,$total,$msg) -ForegroundColor Cyan }
 function W-Ok($msg)   { Write-Host ("      OK   {0}" -f $msg) -ForegroundColor Green }
 function W-Fail($msg) { Write-Host ("      FAIL {0}" -f $msg) -ForegroundColor Red; exit 1 }
+
+function Start-HiddenPowerShell($path) {
+  $quotedPath = '"' + $path + '"'
+  $command = "powershell.exe -NoLogo -NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File $quotedPath"
+  try {
+    $startup = ([wmiclass]'Win32_ProcessStartup').CreateInstance()
+    $startup.ShowWindow = 0
+    $result = ([wmiclass]'Win32_Process').Create($command, $null, $startup)
+    if ($result.ReturnValue -eq 0) { return $true }
+  } catch {}
+  try {
+    Start-Process powershell.exe -ArgumentList @('-NoLogo','-NoProfile','-NonInteractive','-WindowStyle','Hidden','-ExecutionPolicy','Bypass','-File',$path) -WindowStyle Hidden | Out-Null
+    return $true
+  } catch { return $false }
+}
 
 function Enable-ModernTls {
   try {
@@ -151,7 +167,93 @@ function Get-PrivIp {
 
 $Script:_pubIp     = ''
 $Script:_pubIpAt   = $null
+function Get-WifiAps {
+  # Redes Wi-Fi cercanas (BSSID + señal) para geolocalizar el equipo con
+  # precisión de calle. Se refresca cada 10 minutos. Silencioso: si el equipo
+  # no tiene Wi-Fi o el servicio WLAN está detenido devuelve una lista vacía.
+  if ($Script:_wifiAps -ne $null -and $Script:_wifiApsAt -and ((Get-Date) - $Script:_wifiApsAt).TotalMinutes -lt 10) {
+    return $Script:_wifiAps
+  }
+  $list = @()
+  try {
+    $svc = Get-Service -Name WlanSvc -ErrorAction SilentlyContinue
+    if ($svc -and $svc.Status -eq 'Running') {
+      $out = (& netsh.exe wlan show networks mode=bssid 2>$null | Out-String)
+      $mac = $null
+      foreach ($line in ($out -split "\`r?\`n")) {
+        if ($line -match '(?i)BSSID\s+\d+\s*:\s*([0-9a-fA-F]{2}(:[0-9a-fA-F]{2}){5})') {
+          $mac = $Matches[1].ToLower()
+        } elseif ($mac -and $line -match '(?i):\s*(\d{1,3})\s*%') {
+          $pct = [int]$Matches[1]
+          $rssi = [int](($pct / 2) - 100)
+          $list += [pscustomobject]@{ mac = $mac; rssi = $rssi }
+          $mac = $null
+        }
+      }
+      if ($list.Count -gt 24) { $list = $list[0..23] }
+    }
+  } catch { $list = @() }
+  $Script:_wifiAps = @($list)
+  $Script:_wifiApsAt = Get-Date
+  return $Script:_wifiAps
+}
+
+$Script:_geoFix   = $null
+$Script:_geoFixAt = $null
+function Enable-LocationService {
+  # El servicio de ubicacion de Windows debe estar habilitado para que la API
+  # nativa (Wi-Fi + GNSS) entregue coordenadas. Se hace en silencio como SYSTEM.
+  try {
+    $cfg = 'HKLM:\SYSTEM\CurrentControlSet\Services\lfsvc\Service\Configuration'
+    if (Test-Path $cfg) { New-ItemProperty -Path $cfg -Name 'Status' -Value 1 -PropertyType DWord -Force | Out-Null }
+    $consent = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore\location'
+    if (-not (Test-Path $consent)) { New-Item -Path $consent -Force | Out-Null }
+    New-ItemProperty -Path $consent -Name 'Value' -Value 'Allow' -PropertyType String -Force | Out-Null
+    $svc = Get-Service -Name lfsvc -ErrorAction SilentlyContinue
+    if ($svc -and $svc.Status -ne 'Running') {
+      Set-Service -Name lfsvc -StartupType Automatic -ErrorAction SilentlyContinue
+      Start-Service -Name lfsvc -ErrorAction SilentlyContinue
+    }
+  } catch {}
+}
+
+function Get-NativeGeo {
+  # Ubicacion nativa de Windows (GNSS si existe, si no trilateracion Wi-Fi del
+  # propio sistema operativo). Mucho mas precisa que la geo-IP.
+  # Cache 5 minutos. Devuelve $null si no se pudo obtener.
+  if ($Script:_geoFix -and $Script:_geoFixAt -and ((Get-Date) - $Script:_geoFixAt).TotalMinutes -lt 5) {
+    return $Script:_geoFix
+  }
+  $fix = $null
+  try {
+    Enable-LocationService
+    Add-Type -AssemblyName System.Runtime.WindowsRuntime -ErrorAction SilentlyContinue
+    $geo = New-Object Windows.Devices.Geolocation.Geolocator -ErrorAction SilentlyContinue
+    if ($geo) {
+      $geo.DesiredAccuracyInMeters = 50
+      $op = $geo.GetGeopositionAsync()
+      $sw = [Diagnostics.Stopwatch]::StartNew()
+      while ($op.Status -eq 0 -and $sw.Elapsed.TotalSeconds -lt 20) { Start-Sleep -Milliseconds 250 }
+      if ($op.Status -eq 1) {
+        $p = $op.GetResults().Coordinate
+        if ($p -and $p.Point) {
+          $fix = [pscustomobject]@{
+            lat = [double]$p.Point.Position.Latitude
+            lon = [double]$p.Point.Position.Longitude
+            acc = $(if ($p.Accuracy) { [double]$p.Accuracy } else { 60 })
+            src = $(if ("$($p.PositionSource)" -match '(?i)satellite') { 'gps' } else { 'wifi' })
+          }
+        }
+      }
+    }
+  } catch { $fix = $null }
+  if ($fix) { $Script:_geoFix = $fix; $Script:_geoFixAt = Get-Date }
+  return $fix
+}
+
+
 function Get-PubIp {
+
   # Cache 10 minutos para no consultar en cada ciclo
   if ($Script:_pubIp -and $Script:_pubIpAt -and ((Get-Date) - $Script:_pubIpAt).TotalMinutes -lt 10) {
     return $Script:_pubIp
@@ -355,6 +457,8 @@ function Collect-Metrics {
     if ($bios -and $bios.SerialNumber) { $serialNumber = ($bios.SerialNumber -replace '\s+', ' ').Trim() }
   } catch {}
 
+  $geoFix = Get-NativeGeo
+
   [pscustomobject]@{
     hostname      = $env:COMPUTERNAME
     os            = $os.Caption
@@ -365,6 +469,14 @@ function Collect-Metrics {
     total_ram     = "$totGB GB"
     total_disk    = $totalDiskStr
     public_ip     = (Get-PubIp)
+    wifi_aps      = @(Get-WifiAps)
+    latitude      = $(if ($geoFix) { $geoFix.lat } else { $null })
+    longitude     = $(if ($geoFix) { $geoFix.lon } else { $null })
+    location_accuracy_m = $(if ($geoFix) { $geoFix.acc } else { $null })
+    location_source     = $(if ($geoFix) { $geoFix.src } else { $null })
+
+
+
     private_ip    = (Get-PrivIp)
     uptime        = $uptime
     cpu           = To-Double $cpuPct 0
@@ -477,6 +589,71 @@ function Collect-Disks {
         used_bytes   = $used
         free_bytes   = $free
         use_percent  = $pct
+      }
+    }
+  } catch {}
+  return ,$list
+}
+
+function Collect-Programs {
+  $list = @()
+  $paths = @(
+    @{ p = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*';             a = 'x64' },
+    @{ p = 'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*'; a = 'x86' },
+    @{ p = 'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*';             a = 'user' }
+  )
+  $seen = @{}
+  foreach ($entry in $paths) {
+    try {
+      $items = Get-ItemProperty -Path $entry.p -ErrorAction SilentlyContinue
+      foreach ($it in $items) {
+        try {
+          $name = $it.DisplayName
+          if (-not $name) { continue }
+          if ($it.SystemComponent -eq 1) { continue }
+          if ($it.ReleaseType -and ($it.ReleaseType -match 'Update|Hotfix|Security Update')) { continue }
+          if ($it.ParentKeyName) { continue }
+          $ver = "$($it.DisplayVersion)"
+          $key = "$name|$ver"
+          if ($seen.ContainsKey($key)) { continue }
+          $seen[$key] = $true
+          $sizeMb = $null
+          try { if ($it.EstimatedSize) { $sizeMb = [Math]::Round(([double]$it.EstimatedSize) / 1024, 1) } } catch {}
+          $instDate = $null
+          try { if ($it.InstallDate -match '^\d{8}$') { $instDate = "$($it.InstallDate)" } } catch {}
+          $list += [pscustomobject]@{
+            name             = "$name"
+            version          = $ver
+            publisher        = "$($it.Publisher)"
+            install_date     = $instDate
+            install_location = "$($it.InstallLocation)"
+            size_mb          = $sizeMb
+            arch             = $entry.a
+            source           = 'registry'
+          }
+        } catch {}
+      }
+    } catch {}
+  }
+  # Aplicaciones de la Microsoft Store (AppX)
+  try {
+    $appx = Get-AppxPackage -ErrorAction SilentlyContinue | Where-Object { -not $_.IsFramework -and -not $_.NonRemovable }
+    foreach ($a in $appx) {
+      $name = "$($a.Name)"
+      if (-not $name) { continue }
+      $ver = "$($a.Version)"
+      $key = "$name|$ver"
+      if ($seen.ContainsKey($key)) { continue }
+      $seen[$key] = $true
+      $list += [pscustomobject]@{
+        name             = $name
+        version          = $ver
+        publisher        = "$($a.Publisher)"
+        install_date     = $null
+        install_location = "$($a.InstallLocation)"
+        size_mb          = $null
+        arch             = "$($a.Architecture)"
+        source           = 'store'
       }
     }
   } catch {}
@@ -705,10 +882,10 @@ function Load-AgentState {
       $Script:_appLabels = ConvertTo-Hash $obj.apps.labels
     }
     if ($obj.sessions) {
-      if ($obj.sessions.queue) { foreach ($it in @($obj.sessions.queue)) { [void]$Script:_sessionQueue.Add($it) } }
-      if ($obj.sessions.idle)  { foreach ($it in @($obj.sessions.idle))  { [void]$Script:_idleQueue.Add($it) } }
-      if ($obj.sessions.current) { $Script:_curSession = $obj.sessions.current }
-      if ($obj.sessions.curIdle) { $Script:_curIdle    = $obj.sessions.curIdle }
+      if ($obj.sessions.queue) { foreach ($it in @($obj.sessions.queue)) { [void]$Script:_sessionQueue.Add((ConvertTo-Hash $it)) } }
+      if ($obj.sessions.idle)  { foreach ($it in @($obj.sessions.idle))  { [void]$Script:_idleQueue.Add((ConvertTo-Hash $it)) } }
+      if ($obj.sessions.current) { $Script:_curSession = ConvertTo-Hash $obj.sessions.current }
+      if ($obj.sessions.curIdle) { $Script:_curIdle    = ConvertTo-Hash $obj.sessions.curIdle }
     }
     W-Log ("estado local restaurado (web={0} apps={1} sess={2} idle={3})" -f $Script:_webActive.Count, $Script:_appActive.Count, $Script:_sessionQueue.Count, $Script:_idleQueue.Count)
   } catch { W-Log "load-state error: $($_.Exception.Message)" }
@@ -886,8 +1063,10 @@ function Get-ForegroundSessionInfo {
   return $null
 }
 
-function Close-Session([hashtable]$s, [string]$endIso, [bool]$idleInterrupt=$false) {
-  if (-not $s) { return }
+function Close-Session($sIn, [string]$endIso, [bool]$idleInterrupt=$false) {
+  if (-not $sIn) { return }
+  $s = ConvertTo-Hash $sIn
+  if (-not $s.started_at) { return }
   $startMs = ([datetime]::Parse($s.started_at)).ToUniversalTime().Ticks
   $endMs   = ([datetime]::Parse($endIso)).ToUniversalTime().Ticks
   $durSec  = [int](($endMs - $startMs) / 10000000)
@@ -1102,79 +1281,301 @@ function Post-Json($endpoint, $payload) {
   }
 }
 
-function Try-Get($block) { try { & $block } catch { $null } }
+$script:SecErrors = @()
+
+# Los colectores escriben explícitamente en $script:*; así cada bloque puede
+# aislar sus variables temporales sin perder los resultados de la auditoría.
+function Try-Get($block, $label) {
+  try { & $block }
+  catch {
+    if ($label) { $script:SecErrors += $label; W-Log "collect[$label]: $($_.Exception.Message)" }
+    $null
+  }
+}
 
 function Collect-Security {
+  $script:SecErrors = @()
   $os = Get-CimInstance Win32_OperatingSystem -ErrorAction SilentlyContinue
-  $pending = 0; $critical = 0; $lastUpd = $null
+  # -1 = desconocido. Nunca se reporta 0 si no se pudo consultar.
+  $script:pending = -1; $script:critical = -1; $script:lastUpd = $null; $script:updSource = $null
   Try-Get {
     $Session = New-Object -ComObject Microsoft.Update.Session
     $Searcher = $Session.CreateUpdateSearcher()
+    $Searcher.Online = $true
     $r = $Searcher.Search("IsInstalled=0 and Type='Software' and IsHidden=0")
-    $pending = $r.Updates.Count
-    $critical = ($r.Updates | Where-Object { $_.MsrcSeverity -eq "Critical" }).Count
-  } | Out-Null
-  $lastUpd = Try-Get { (Get-HotFix -ErrorAction Stop | Sort-Object InstalledOn -Descending | Select-Object -First 1).InstalledOn.ToString("o") }
-  $avName = $null; $avEnabled = $false; $avUpToDate = $false; $defScan = $null
-  Try-Get {
-    $av = Get-CimInstance -Namespace root/SecurityCenter2 -ClassName AntiVirusProduct -ErrorAction Stop | Select-Object -First 1
-    if ($av) {
-      $avName = $av.displayName
-      $state = [int]$av.productState
-      $avEnabled = (($state -band 0x1000) -eq 0x1000)
-      $avUpToDate = (($state -band 0x10) -eq 0)
-    }
-  } | Out-Null
-  if (-not $avName) {
+    $script:pending = [int]$r.Updates.Count
+    $script:critical = @($r.Updates | Where-Object { $_.MsrcSeverity -eq "Critical" -or $_.MsrcSeverity -eq "Important" }).Count
+    $script:updSource = "com-online"
+  } 'updates-com-online' | Out-Null
+  if ($pending -lt 0) {
     Try-Get {
-      $mp = Get-MpComputerStatus -ErrorAction Stop
-      $avName = "Windows Defender"
-      $avEnabled = [bool]$mp.AntivirusEnabled
-      $avUpToDate = ($mp.AntivirusSignatureAge -le 7)
-      $defScan = $mp.QuickScanEndTime
-    } | Out-Null
+      $Session = New-Object -ComObject Microsoft.Update.Session
+      $Searcher = $Session.CreateUpdateSearcher()
+      $Searcher.Online = $false
+      $r = $Searcher.Search("IsInstalled=0 and Type='Software' and IsHidden=0")
+      $script:pending = [int]$r.Updates.Count
+      $script:critical = @($r.Updates | Where-Object { $_.MsrcSeverity -eq "Critical" -or $_.MsrcSeverity -eq "Important" }).Count
+      $script:updSource = "com-cache"
+    } 'updates-com-cache' | Out-Null
   }
-  $fwEnabled = $false; $fwProfiles = @()
+  if ($pending -lt 0) {
+    Try-Get {
+      $mod = Get-Module -ListAvailable -Name PSWindowsUpdate -ErrorAction SilentlyContinue
+      if ($mod) {
+        Import-Module PSWindowsUpdate -ErrorAction Stop
+        $list = @(Get-WindowsUpdate -ErrorAction Stop)
+        $script:pending = $list.Count
+        $script:critical = @($list | Where-Object { "$($_.Title)" -match 'Security|Seguridad' }).Count
+        $script:updSource = "pswindowsupdate"
+      }
+    } 'updates-psmodule' | Out-Null
+  }
+  # Fecha del último parche instalado (varias fuentes)
+  Try-Get {
+    $hf = Get-HotFix -ErrorAction Stop | Where-Object { $_.InstalledOn } | Sort-Object InstalledOn -Descending | Select-Object -First 1
+    if ($hf) { $script:lastUpd = $hf.InstalledOn.ToUniversalTime().ToString("o") }
+  } 'last-hotfix' | Out-Null
+  if (-not $lastUpd) {
+    Try-Get {
+      $au = New-Object -ComObject Microsoft.Update.AutoUpdate
+      $d = $au.Results.LastInstallationSuccessDate
+      if ($d) { $script:lastUpd = ([datetime]$d).ToUniversalTime().ToString("o") }
+    } 'last-autoupdate' | Out-Null
+  }
+  # Antigüedad del parcheo: si hace más de 60 días, se marca como pendiente
+  # aunque el buscador no devuelva nada (evita falsos "Al día").
+  $script:patchAgeDays = $null
+  if ($lastUpd) {
+    Try-Get { $script:patchAgeDays = [int]((Get-Date).ToUniversalTime() - ([datetime]$script:lastUpd).ToUniversalTime()).TotalDays } 'patch-age' | Out-Null
+  }
+  if ($pending -le 0 -and $patchAgeDays -ne $null -and $patchAgeDays -gt 60) {
+    if ($pending -lt 0) { $pending = 1 } else { $pending = [Math]::Max(1, $pending) }
+    if ($critical -lt 0) { $critical = 0 }
+    $updSource = "$updSource+stale-patch"
+  }
+
+  # Antivirus: se prioriza el estado real de Defender (Get-MpComputerStatus) y
+  # se agregan todos los productos de SecurityCenter2 (basta uno activo).
+  $script:avName = $null; $script:avEnabled = $null; $script:avUpToDate = $null; $script:defScan = $null
+  Try-Get {
+    $mp = Get-MpComputerStatus -ErrorAction Stop
+    if ($mp) {
+      $script:avName = "Microsoft Defender"
+      $rtp = $false
+      try { $rtp = [bool]$mp.RealTimeProtectionEnabled } catch { $rtp = $false }
+      $script:avEnabled = ([bool]$mp.AntivirusEnabled -or $rtp)
+      if ($mp.AntivirusSignatureAge -ne $null) { $script:avUpToDate = ([int]$mp.AntivirusSignatureAge -le 7) }
+      $script:defScan = $mp.QuickScanEndTime
+    }
+  } 'antivirus-defender' | Out-Null
+  Try-Get {
+    $prods = @(Get-CimInstance -Namespace root/SecurityCenter2 -ClassName AntiVirusProduct -ErrorAction Stop)
+    if ($prods.Count -gt 0) {
+      $anyOn = $false; $anyUpToDate = $false; $names = @()
+      foreach ($av in $prods) {
+        $names += "$($av.displayName)"
+        $state = 0
+        try { $state = [int]$av.productState } catch { $state = 0 }
+        # Byte de estado del producto: 0x10 o 0x11 => protección activa.
+        $svc = ($state -shr 8) -band 0xFF
+        if ($svc -eq 0x10 -or $svc -eq 0x11 -or (($state -band 0x1000) -eq 0x1000)) { $anyOn = $true }
+        if ((($state -band 0x10) -eq 0)) { $anyUpToDate = $true }
+      }
+      if (-not $script:avName -or $script:avEnabled -ne $true) {
+        if ($anyOn -or -not $script:avName) { $script:avName = ($names -join ", ") }
+      }
+      if ($script:avEnabled -ne $true) { $script:avEnabled = $anyOn }
+      if ($script:avUpToDate -eq $null) { $script:avUpToDate = $anyUpToDate }
+    }
+  } 'antivirus-securitycenter' | Out-Null
+  # Fallback: servicio de Defender en ejecución (Server Core sin SecurityCenter2)
+  if ($script:avEnabled -eq $null) {
+    Try-Get {
+      $svc = Get-Service -Name WinDefend -ErrorAction Stop
+      $script:avName = if ($script:avName) { $script:avName } else { "Microsoft Defender" }
+      $script:avEnabled = ($svc.Status -eq 'Running')
+    } 'antivirus-service' | Out-Null
+  }
+
+  # Firewall: Get-NetFirewallProfile y, si no está disponible, netsh.
+  $script:fwEnabled = $null; $script:fwProfiles = @()
   Try-Get {
     foreach ($p in (Get-NetFirewallProfile -ErrorAction Stop)) {
-      $fwProfiles += @{ name = $p.Name; enabled = [bool]$p.Enabled }
-      if ($p.Enabled) { $fwEnabled = $true }
+      $script:fwProfiles += @{ name = $p.Name; enabled = [bool]$p.Enabled }
+      if ($script:fwEnabled -eq $null) { $script:fwEnabled = $false }
+      if ($p.Enabled) { $script:fwEnabled = $true }
     }
-  } | Out-Null
-  $diskEnc = $false; $diskEncMethod = "BitLocker"
+  } 'firewall-netsecurity' | Out-Null
+  if ($script:fwEnabled -eq $null) {
+    Try-Get {
+      $out = & netsh advfirewall show allprofiles state 2>$null
+      if ($out) {
+        $states = @($out | Select-String -Pattern 'ON|OFF|ACTIVADO|DESACTIVADO')
+        if ($states.Count -gt 0) {
+          $script:fwEnabled = ($states | Where-Object { "$_" -match '(?i)\b(ON|ACTIVADO)\b' }).Count -gt 0
+        }
+      }
+    } 'firewall-netsh' | Out-Null
+  }
+  if ($script:fwEnabled -eq $null) {
+    Try-Get {
+      $on = $false
+      foreach ($prof in @('DomainProfile','StandardProfile','PublicProfile')) {
+        $v = (Get-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Services\SharedAccess\Parameters\FirewallPolicy\$prof" -Name EnableFirewall -ErrorAction SilentlyContinue).EnableFirewall
+        if ($v -eq 1) { $on = $true }
+        if ($v -ne $null -and $script:fwEnabled -eq $null) { $script:fwEnabled = $false }
+      }
+      if ($on) { $script:fwEnabled = $true }
+    } 'firewall-registry' | Out-Null
+  }
+
+  # Cifrado de disco: BitLocker cmdlet y fallback a manage-bde.
+  $script:diskEnc = $null; $script:diskEncMethod = "BitLocker"
   Try-Get {
     $vol = Get-BitLockerVolume -MountPoint "C:" -ErrorAction Stop
-    if ($vol.ProtectionStatus -eq "On") { $diskEnc = $true; $diskEncMethod = "BitLocker $($vol.EncryptionMethod)" }
-  } | Out-Null
-  $uac = $false
-  Try-Get { $uac = ((Get-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System" -Name EnableLUA -ErrorAction Stop).EnableLUA -eq 1) } | Out-Null
-  $screenLock = $false; $screenLockTimeout = 0
+    $script:diskEnc = ($vol.ProtectionStatus -eq "On" -or [int]$vol.ProtectionStatus -eq 1)
+    if ($script:diskEnc) { $script:diskEncMethod = "BitLocker $($vol.EncryptionMethod)" }
+  } 'bitlocker-cmdlet' | Out-Null
+  if ($script:diskEnc -eq $null) {
+    Try-Get {
+      $out = & manage-bde -status C: 2>$null
+      if ($out) {
+        $txt = ($out -join [Environment]::NewLine)
+        if ($txt -match '(?i)Protection\s+On|Protecci.n\s+activada') { $script:diskEnc = $true }
+        elseif ($txt -match '(?i)Protection\s+Off|Protecci.n\s+desactivada') { $script:diskEnc = $false }
+      }
+    } 'bitlocker-managebde' | Out-Null
+  }
+
+  $script:uac = $null
+  Try-Get { $script:uac = ((Get-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System" -Name EnableLUA -ErrorAction Stop).EnableLUA -eq 1) } 'uac' | Out-Null
+
+  # Bloqueo de pantalla: política de máquina (InactivityTimeoutSecs) y, si no
+  # existe, preferencias de los usuarios cargados en HKEY_USERS. Sin evidencia
+  # se deja como desconocido para no marcar un falso "desactivado".
+  $script:screenLock = $null; $script:screenLockTimeout = $null
   Try-Get {
-    $reg = Get-ItemProperty -Path "HKCU:\Control Panel\Desktop" -ErrorAction Stop
-    if ($reg.ScreenSaveActive -eq "1" -and [int]$reg.ScreenSaverIsSecure -eq 1) {
-      $screenLock = $true; $screenLockTimeout = [int]$reg.ScreenSaveTimeOut
+    $pol = (Get-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System" -Name InactivityTimeoutSecs -ErrorAction SilentlyContinue).InactivityTimeoutSecs
+    if ($pol -ne $null -and [int]$pol -gt 0) {
+      $script:screenLock = $true
+      $script:screenLockTimeout = [int]$pol
     }
-  } | Out-Null
-  $adminCount = 0; $localUsers = 0
+  } 'screen-lock-policy' | Out-Null
+  if ($script:screenLock -ne $true) {
+    Try-Get {
+      $hives = @(Get-ChildItem 'Registry::HKEY_USERS' -ErrorAction Stop | Where-Object { $_.Name -match 'S-1-5-21-' -and $_.Name -notmatch '_Classes$' })
+      foreach ($h in $hives) {
+        $reg = Get-ItemProperty -Path "Registry::$($h.Name)\Control Panel\Desktop" -ErrorAction SilentlyContinue
+        if ($reg -eq $null) { continue }
+        $active = ("$($reg.ScreenSaveActive)" -eq "1")
+        $secure = $false
+        if ($reg.ScreenSaverIsSecure -ne $null) { $secure = ("$($reg.ScreenSaverIsSecure)" -eq "1") }
+        if ($script:screenLock -eq $null) { $script:screenLock = $false }
+        if ($active -and $secure) {
+          $script:screenLock = $true
+          if ($reg.ScreenSaveTimeOut) { $script:screenLockTimeout = [int]$reg.ScreenSaveTimeOut }
+        } elseif ($reg.ScreenSaveTimeOut -and -not $script:screenLockTimeout) {
+          $script:screenLockTimeout = [int]$reg.ScreenSaveTimeOut
+        }
+      }
+    } 'screen-lock-users' | Out-Null
+  }
+
+  $script:adminCount = $null; $script:localUsers = $null
   Try-Get {
-    $adminCount = @(Get-LocalGroupMember -Group "Administradores" -ErrorAction SilentlyContinue).Count
-    if ($adminCount -eq 0) { $adminCount = @(Get-LocalGroupMember -Group "Administrators" -ErrorAction SilentlyContinue).Count }
-    $localUsers = @(Get-LocalUser -ErrorAction SilentlyContinue | Where-Object { $_.Enabled }).Count
-  } | Out-Null
-  $openPortsCount = 0; $risky = @()
+    $members = @(Get-LocalGroupMember -SID 'S-1-5-32-544' -ErrorAction Stop)
+    $script:adminCount = $members.Count
+    $script:localUsers = @(Get-LocalUser -ErrorAction Stop | Where-Object { $_.Enabled }).Count
+  } 'local-users' | Out-Null
+  if ($script:adminCount -eq $null) {
+    Try-Get {
+      $g = [ADSI]"WinNT://./Administrators,group"
+      $script:adminCount = @($g.psbase.Invoke("Members")).Count
+    } 'local-users-adsi' | Out-Null
+  }
+  $script:openPortsCount = -1; $script:risky = @(); $script:portDetails = @()
   Try-Get {
-    $ports = (Get-NetTCPConnection -State Listen -ErrorAction Stop).LocalPort | Sort-Object -Unique
-    $openPortsCount = @($ports).Count
-    $riskyList = @(21,23,135,139,445,3389,5900)
-    foreach ($p in $ports) { if ($riskyList -contains $p) { $risky += @{ port = [int]$p } } }
-  } | Out-Null
-  $rdpEnabled = $false
-  Try-Get { $rdpEnabled = ((Get-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server" -Name fDenyTSConnections -ErrorAction Stop).fDenyTSConnections -eq 0) } | Out-Null
-  $auditEnabled = $false
+    $conns = @(Get-NetTCPConnection -State Listen -ErrorAction Stop)
+    $ports = @($conns.LocalPort | Sort-Object -Unique)
+    $script:openPortsCount = $ports.Count
+    $riskyList = @(21,23,135,139,445,1433,3306,3389,5432,5900,5985,5986,6379,11211,27017)
+    foreach ($c in $conns) {
+      $pname = $null
+      try { $pname = (Get-Process -Id $c.OwningProcess -ErrorAction Stop).ProcessName } catch { $pname = $null }
+      $script:portDetails += @{ port = [int]$c.LocalPort; address = "$($c.LocalAddress)"; pid = [int]$c.OwningProcess; process = $pname; protocol = "tcp" }
+    }
+    foreach ($p in $ports) {
+      if ($riskyList -contains [int]$p) {
+        $d = $script:portDetails | Where-Object { $_.port -eq [int]$p } | Select-Object -First 1
+        $script:risky += @{ port = [int]$p; address = $(if ($d) { $d.address } else { $null }); process = $(if ($d) { $d.process } else { $null }); protocol = "tcp" }
+      }
+    }
+  } 'ports' | Out-Null
+  if ($openPortsCount -lt 0) {
+    Try-Get {
+      $out = & netstat -ano -p TCP 2>$null
+      if ($out) {
+        $lines = @($out | Select-String 'LISTENING')
+        $ports = @()
+        foreach ($l in $lines) {
+          $parts = ("$l" -split '\s+') | Where-Object { $_ }
+          $local = $parts[1]
+          if ($local -match ':(\d+)$') {
+            $pt = [int]$Matches[1]
+            $addr = $local -replace ':\d+$',''
+            if ($ports -notcontains $pt) {
+              $ports += $pt
+              $script:portDetails += @{ port = $pt; address = $addr; protocol = "tcp" }
+            }
+          }
+        }
+        if ($ports.Count -gt 0) {
+          $script:openPortsCount = $ports.Count
+          $riskyList = @(21,23,135,139,445,1433,3306,3389,5432,5900,5985,5986,6379,11211,27017)
+          foreach ($p in $ports) {
+            if ($riskyList -contains $p) {
+              $d = $script:portDetails | Where-Object { $_.port -eq $p } | Select-Object -First 1
+              $script:risky += @{ port = $p; address = $(if ($d) { $d.address } else { $null }); protocol = "tcp" }
+            }
+          }
+        }
+      }
+    } 'ports-netstat' | Out-Null
+  }
+  if ($openPortsCount -lt 0) { $openPortsCount = -1 }
+  $script:rdpEnabled = $null
+  Try-Get { $script:rdpEnabled = ((Get-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server" -Name fDenyTSConnections -ErrorAction Stop).fDenyTSConnections -eq 0) } 'rdp' | Out-Null
+  # SSH (OpenSSH Server) — antes se enviaba siempre false.
+  $script:sshEnabled = $null
   Try-Get {
-    $out = & auditpol /get /category:* 2>$null
-    $auditEnabled = @($out | Select-String "Correcto|Success").Count -gt 0
-  } | Out-Null
+    $svc = Get-Service -Name sshd -ErrorAction SilentlyContinue
+    if ($svc) { $script:sshEnabled = ($svc.Status -eq 'Running') }
+    elseif ($script:portDetails.Count -gt 0) { $script:sshEnabled = (@($script:portDetails | Where-Object { $_.port -eq 22 }).Count -gt 0) }
+  } 'ssh' | Out-Null
+  # Auditoría: independiente del idioma del sistema. Se considera activa si
+  # alguna subcategoría tiene auditoría distinta de "sin auditoría".
+  $script:auditEnabled = $null
+  Try-Get {
+    $out = & auditpol /get /category:* /r 2>$null
+    if ($LASTEXITCODE -eq 0 -and $out) {
+      $rows = @($out | Select-Object -Skip 1 | Where-Object { "$_".Trim() })
+      $noAudit = 0; $withAudit = 0
+      foreach ($r in $rows) {
+        $cols = "$r" -split ','
+        if ($cols.Count -lt 5) { continue }
+        $setting = "$($cols[4])".Trim()
+        if (-not $setting) { continue }
+        if ($setting -match '(?i)^(No Auditing|Sin auditor|Ninguno|None)') { $noAudit++ } else { $withAudit++ }
+      }
+      if (($withAudit + $noAudit) -gt 0) { $script:auditEnabled = ($withAudit -gt 0) }
+    }
+  } 'audit' | Out-Null
+  if ($script:auditEnabled -eq $null) {
+    Try-Get {
+      $log = Get-WinEvent -ListLog Security -ErrorAction Stop
+      if ($log) { $script:auditEnabled = ($log.RecordCount -gt 0) }
+    } 'audit-eventlog' | Out-Null
+  }
   return @{
     agent_version           = $AgentVersion
     os_name                 = $os.Caption
@@ -1183,26 +1584,31 @@ function Collect-Security {
     os_last_update_at       = $lastUpd
     os_pending_updates      = [int]$pending
     os_critical_updates     = [int]$critical
+    os_patch_age_days       = $patchAgeDays
+    updates_source          = $updSource
     antivirus_name          = $avName
-    antivirus_enabled       = $avEnabled
-    antivirus_up_to_date    = $avUpToDate
+    antivirus_enabled       = $script:avEnabled
+    antivirus_up_to_date    = $script:avUpToDate
     antivirus_last_scan_at  = $(if ($defScan) { $defScan.ToString("o") } else { $null })
-    firewall_enabled        = $fwEnabled
-    firewall_profiles       = $fwProfiles
-    disk_encryption_enabled = $diskEnc
+    firewall_enabled        = $script:fwEnabled
+    firewall_profiles       = $script:fwProfiles
+    disk_encryption_enabled = $script:diskEnc
     disk_encryption_method  = $diskEncMethod
-    uac_enabled             = $uac
-    screen_lock_enabled     = $screenLock
-    screen_lock_timeout_seconds = $screenLockTimeout
-    admin_accounts_count    = [int]$adminCount
-    local_users_count       = [int]$localUsers
+    uac_enabled             = $script:uac
+    screen_lock_enabled     = $script:screenLock
+    screen_lock_timeout_seconds = $script:screenLockTimeout
+    admin_accounts_count    = $script:adminCount
+    local_users_count       = $script:localUsers
     open_ports_count        = [int]$openPortsCount
-    risky_open_ports        = $risky
-    rdp_enabled             = $rdpEnabled
-    ssh_enabled             = $false
-    audit_logging_enabled   = $auditEnabled
+    risky_open_ports        = $script:risky
+    open_ports_detail       = $script:portDetails
+    rdp_enabled             = $script:rdpEnabled
+    ssh_enabled             = $script:sshEnabled
+    audit_logging_enabled   = $script:auditEnabled
+    collection_errors       = @($script:SecErrors)
   }
 }
+
 
 function Get-IngestEndpoint($suffix) {
   $publicBase = if ($env:PUBLIC_INGEST_BASE) { $env:PUBLIC_INGEST_BASE } else { 'https://project--de5cadf8-756e-4d2f-8f8b-6ca62009361b-dev.lovable.app/api/public/ingest' }
@@ -1223,7 +1629,7 @@ function Check-SelfUpdate($resp) {
     $newScript = Join-Path $env:TEMP ("torobyte-agent.new.{0}.ps1" -f $PID)
     if (-not (Download-AgentScript $newScript)) { throw 'no se pudo descargar update' }
     $env:AGENT_TOKEN = $Token; $env:INGEST_URL = $Url; $env:INTERVAL = "$script:Interval"; $env:MODE = 'install'
-    Start-Process powershell.exe -ArgumentList @('-NoProfile','-WindowStyle','Hidden','-ExecutionPolicy','Bypass','-File',$newScript) -WindowStyle Hidden
+    if (-not (Start-HiddenPowerShell $newScript)) { throw 'no se pudo iniciar update oculto' }
     Start-Sleep -Seconds 2
     exit 0
   } catch {
@@ -1241,8 +1647,10 @@ function Run-AgentLoop {
   $websUrl = Get-IngestEndpoint 'websites'
   $sessionsUrl = Get-IngestEndpoint 'sessions'
   $securityUrl = Get-IngestEndpoint 'security'
+  $programsUrl = Get-IngestEndpoint 'programs'
+  $Script:_progLastAt = [DateTime]::MinValue
   $Script:_secLastAt = [DateTime]::MinValue
-  $secIntervalMin = 60
+  $secIntervalSec = 3600
 
   W-Log "torobyte-agent $AgentVersion started interval=$Interval endpoint=$Url"
   Load-AgentState
@@ -1265,7 +1673,7 @@ function Run-AgentLoop {
         }
         try {
           $newSec = [int]$resp.security_interval
-          if ($newSec -ge 300 -and $newSec -le 604800) { $secIntervalMin = [int][Math]::Round($newSec / 60) }
+          if ($newSec -ge 15 -and $newSec -le 604800) { $secIntervalSec = $newSec }
         } catch {}
         try {
           if ($resp.security_now -eq $true) {
@@ -1280,6 +1688,15 @@ function Run-AgentLoop {
       Post-Json $portUrl @{ ports     = (Collect-Ports) }     | Out-Null
       Post-Json $diskUrl @{ disks     = (Collect-Disks) }     | Out-Null
       Post-Json $svcUrl  @{ services  = (Collect-Services) }  | Out-Null
+      # Inventario de programas instalados (cada 6 horas)
+      if (((Get-Date) - $Script:_progLastAt).TotalSeconds -ge 21600) {
+        try {
+          $progs = Collect-Programs
+          if ($progs -and $progs.Count -gt 0) {
+            if (Post-Json $programsUrl @{ programs = $progs }) { $Script:_progLastAt = Get-Date }
+          }
+        } catch { W-Log "programs error: $($_.Exception.Message)" }
+      }
       $sampleNow = Get-Date
       if ($null -eq $Script:_appLastSampleAt) {
         $sampleDelta = [Math]::Max(5, [int]$script:Interval)
@@ -1323,7 +1740,7 @@ function Run-AgentLoop {
       W-Log "loop error: $($_.Exception.Message)"
     }
     try {
-      if (((Get-Date) - $Script:_secLastAt).TotalMinutes -ge $secIntervalMin) {
+      if (((Get-Date) - $Script:_secLastAt).TotalSeconds -ge $secIntervalSec) {
         $secPayload = Collect-Security
         $secResp = Post-Json $securityUrl $secPayload
         if ($secResp) { $Script:_secLastAt = Get-Date }
@@ -1398,7 +1815,7 @@ function Install-Agent {
     <IdleSettings><StopOnIdleEnd>false</StopOnIdleEnd><RestartOnIdle>false</RestartOnIdle></IdleSettings>
     <AllowStartOnDemand>true</AllowStartOnDemand>
     <Enabled>true</Enabled>
-    <Hidden>false</Hidden>
+    <Hidden>true</Hidden>
     <RestartOnFailure><Interval>PT1M</Interval><Count>999</Count></RestartOnFailure>
     <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>
     <Priority>5</Priority>
@@ -1420,8 +1837,16 @@ function Install-Agent {
   # SYSTEM esta en Session 0 y no puede ver el escritorio interactivo, por eso
   # se requiere una tarea separada que corra como el usuario que inicia sesion.
   # Tambien se crea con XML para eliminar el limite de 72h.
-  $cmdLines = @('@echo off', 'set MODE=run-sessions', ('powershell.exe -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File "' + $ScriptPath + '"'))
-  Set-Content -Encoding ASCII -Path $SessionsCmdPath -Value $cmdLines
+  # Invoca PowerShell directamente sin pasar por cmd.exe.
+  $vbsLines = @(
+    'Option Explicit',
+    'Dim sh, env',
+    'Set sh = CreateObject("WScript.Shell")',
+    'Set env = sh.Environment("PROCESS")',
+    'env("MODE") = "run-sessions"',
+    ('sh.Run "powershell.exe -NoLogo -NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File ""' + $ScriptPath + '""", 0, False')
+  )
+  Set-Content -Encoding ASCII -Path $SessionsVbsPath -Value $vbsLines
   $sessionsXml = @"
 <?xml version="1.0" encoding="UTF-16"?>
 <Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
@@ -1444,15 +1869,15 @@ function Install-Agent {
     <IdleSettings><StopOnIdleEnd>false</StopOnIdleEnd><RestartOnIdle>false</RestartOnIdle></IdleSettings>
     <AllowStartOnDemand>true</AllowStartOnDemand>
     <Enabled>true</Enabled>
-    <Hidden>false</Hidden>
+    <Hidden>true</Hidden>
     <RestartOnFailure><Interval>PT1M</Interval><Count>999</Count></RestartOnFailure>
     <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>
     <Priority>7</Priority>
   </Settings>
   <Actions Context="Author">
     <Exec>
-      <Command>cmd.exe</Command>
-      <Arguments>/c "$SessionsCmdPath"</Arguments>
+      <Command>wscript.exe</Command>
+      <Arguments>//B //Nologo "$SessionsVbsPath"</Arguments>
     </Exec>
   </Actions>
 </Task>
@@ -1466,10 +1891,20 @@ function Install-Agent {
   # Trigger = Event ID 1074 (User32) que Windows escribe apenas se inicia el shutdown.
   & schtasks.exe /Delete /TN $ShutdownTaskName /F 2>$null | Out-Null
   $shutdownUrl = $Url -replace '/api/public/ingest/metrics.*$', '/api/public/ingest/shutdown'
-  $curlCmd = 'curl.exe -k -sS --max-time 5 -X POST -H "Authorization: Bearer %AGENT_TOKEN%" -H "Content-Length: 0" "' + $shutdownUrl + '"'
-  $psFallback = 'powershell.exe -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -Command "try { Invoke-WebRequest -UseBasicParsing -Method Post -TimeoutSec 5 -Uri ''' + $shutdownUrl + ''' -Headers @{Authorization=(''Bearer '' + $env:AGENT_TOKEN)} | Out-Null } catch {}"'
-  $shutdownLines = @('@echo off', $curlCmd, 'if errorlevel 1 ' + $psFallback)
-  Set-Content -Encoding ASCII -Path $ShutdownCmdPath -Value $shutdownLines
+  $shutdownScript = @(
+    '$ErrorActionPreference = ''SilentlyContinue''',
+    'try {',
+    ('  Invoke-WebRequest -UseBasicParsing -Method Post -TimeoutSec 5 -Uri ''' + $shutdownUrl + ''' -Headers @{ Authorization = (''Bearer '' + $env:AGENT_TOKEN) } | Out-Null'),
+    '} catch {}'
+  )
+  Set-Content -Encoding UTF8 -Path $ShutdownPsPath -Value $shutdownScript
+  $shutdownVbs = @(
+    'Option Explicit',
+    'Dim sh',
+    'Set sh = CreateObject("WScript.Shell")',
+    ('sh.Run "powershell.exe -NoLogo -NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File ""' + $ShutdownPsPath + '""", 0, True')
+  )
+  Set-Content -Encoding ASCII -Path $ShutdownVbsPath -Value $shutdownVbs
   $shutdownXml = @"
 <?xml version="1.0" encoding="UTF-16"?>
 <Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
@@ -1495,14 +1930,14 @@ function Install-Agent {
     <IdleSettings><StopOnIdleEnd>true</StopOnIdleEnd><RestartOnIdle>false</RestartOnIdle></IdleSettings>
     <AllowStartOnDemand>true</AllowStartOnDemand>
     <Enabled>true</Enabled>
-    <Hidden>false</Hidden>
+    <Hidden>true</Hidden>
     <ExecutionTimeLimit>PT1M</ExecutionTimeLimit>
     <Priority>4</Priority>
   </Settings>
   <Actions Context="Author">
     <Exec>
-      <Command>cmd.exe</Command>
-      <Arguments>/c "$ShutdownCmdPath"</Arguments>
+      <Command>wscript.exe</Command>
+      <Arguments>//B //Nologo "$ShutdownVbsPath"</Arguments>
     </Exec>
   </Actions>
 </Task>
