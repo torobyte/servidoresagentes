@@ -14,7 +14,7 @@ $p=0;'Ssl3','Tls','Tls11','Tls12','Tls13'|%{try{$p=$p-bor[Net.SecurityProtocolTy
 try { [Net.ServicePointManager]::ServerCertificateValidationCallback = { $true } } catch {}
 $ErrorActionPreference = 'Continue'
 
-$AgentVersion = '2.4.4-windows'
+$AgentVersion = '2.4.5-windows'
 $Token        = if ($env:AGENT_TOKEN) { $env:AGENT_TOKEN } else { $env:TOKEN }
 $Url          = if ($env:INGEST_URL)  { $env:INGEST_URL }  else { $env:URL }
 $Interval     = if ($env:INTERVAL)    { [int]$env:INTERVAL } else { 5 }
@@ -372,10 +372,9 @@ function Collect-Metrics {
     if ($bios -and $bios.SerialNumber) { $serialNumber = ($bios.SerialNumber -replace '\s+', ' ').Trim() }
   } catch {}
 
-  $geoFix = Get-UserGeoFix
-  if (-not $geoFix) { $geoFix = Get-NativeGeo }
-  $gpsConsent = Get-GpsConsent
-  if ($gpsConsent -and "$($gpsConsent.state)" -eq 'granted') { Grant-LocationCapability }
+  # Geolocalización deshabilitada por política
+  $geoFix = $null
+  $gpsConsent = 'denied'
 
   [pscustomobject]@{
     hostname      = $env:COMPUTERNAME
