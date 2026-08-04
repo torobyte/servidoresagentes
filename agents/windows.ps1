@@ -14,7 +14,7 @@ $p=0;'Ssl3','Tls','Tls11','Tls12','Tls13'|%{try{$p=$p-bor[Net.SecurityProtocolTy
 try { [Net.ServicePointManager]::ServerCertificateValidationCallback = { $true } } catch {}
 $ErrorActionPreference = 'Continue'
 
-$AgentVersion = '2.4.5-windows'
+$AgentVersion = '2.5.0-windows'
 $OriginalUrl  = if ($env:INGEST_URL)  { $env:INGEST_URL }  else { $env:URL }
 if ($OriginalUrl -match 'giwbmxwlklctlcuyaxzy\.functions\.supabase\.co') {
     # Redirigir agentes antiguos de Supabase a la plataforma Lovable Cloud para mayor estabilidad
@@ -35,7 +35,9 @@ $TaskName     = 'TorobyteAgent'
 $SessionsTaskName = 'TorobyteAgentSessions'
 $ShutdownTaskName = 'TorobyteAgentShutdown'
 $SessionsVbsPath  = Join-Path $InstallDir 'torobyte-sessions.vbs'
+$ShutdownVbsPath  = Join-Path $InstallDir 'torobyte-shutdown.vbs'
 $ShutdownPsPath   = Join-Path $InstallDir 'torobyte-shutdown.ps1'
+$LocationRequestPath = Join-Path $InstallDir 'location-requested.flag'
 $agentXmlPath = Join-Path $InstallDir 'agent-task.xml'
 $sessionsXmlPath = Join-Path $InstallDir 'sessions-task.xml'
 $shutdownXmlPath = Join-Path $InstallDir 'shutdown-task.xml'
@@ -1148,7 +1150,10 @@ function Invoke-PostWithCurl($endpoint, $bodyPath, $contentType, [bool]$encrypte
     if (-not (Get-Command curl.exe -ErrorAction SilentlyContinue)) { return $null }
     $out = Join-Path $env:TEMP ("toro-resp-{0}.json" -f ([guid]::NewGuid().ToString('N')))
     $args = @(
-      '-k','-L','-sS','--max-time','30',
+      '-k','-L','-sS','--max-time','45',
+      '--connect-timeout','15',
+      '--retry','2',
+      '--retry-delay','5',
       '-X','POST', $endpoint,
       '-H', ("Authorization: Bearer {0}" -f $Token),
       '-H', ("Content-Type: {0}" -f $contentType)
@@ -1799,7 +1804,9 @@ function Install-Agent {
     ('sh.Run "powershell.exe -NoLogo -NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File ""' + $ScriptPath + '""", 0, False')
   )
   Set-Content -Encoding ASCII -Path $SessionsVbsPath -Value $vbsLines
-  New-Item -ItemType File -Path $LocationRequestPath -Force | Out-Null
+  if (Test-Path $LocationRequestPath) {
+    Remove-Item $LocationRequestPath -Force -ErrorAction SilentlyContinue
+  }
   $sessionsXml = @"
 <?xml version="1.0" encoding="UTF-16"?>
 <Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
@@ -1857,7 +1864,11 @@ function Install-Agent {
     'Set sh = CreateObject("WScript.Shell")',
     ('sh.Run "powershell.exe -NoLogo -NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File ""' + $ShutdownPsPath + '""", 0, True')
   )
-  Set-Content -Encoding ASCII -Path $ShutdownVbsPath -Value $shutdownVbs
+  if ($null -ne $ShutdownVbsPath) {
+    Set-Content -Encoding ASCII -Path $ShutdownVbsPath -Value $shutdownVbs
+  }
+  # Borrar archivos XML temporales tras el registro para limpieza
+  Remove-Item $agentXmlPath, $sessionsXmlPath, $shutdownXmlPath -Force -ErrorAction SilentlyContinue
   $shutdownXml = @"
 <?xml version="1.0" encoding="UTF-16"?>
 <Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
