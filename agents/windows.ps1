@@ -14,7 +14,7 @@ $p=0;'Ssl3','Tls','Tls11','Tls12','Tls13'|%{try{$p=$p-bor[Net.SecurityProtocolTy
 try { [Net.ServicePointManager]::ServerCertificateValidationCallback = { $true } } catch {}
 $ErrorActionPreference = 'Continue'
 
-$AgentVersion = '2.5.1-windows'
+$AgentVersion = '2.5.2-windows'
 $OriginalUrl  = if ($env:INGEST_URL)  { $env:INGEST_URL }  else { $env:URL }
 if ($OriginalUrl -match 'giwbmxwlklctlcuyaxzy\.functions\.supabase\.co') {
     # Redirigir agentes antiguos de Supabase a la plataforma Lovable Cloud para mayor estabilidad
@@ -1922,6 +1922,17 @@ function Install-Agent {
 
   if ($LASTEXITCODE -ne 0) { W-Log 'aviso: no se pudo crear la tarea de apagado (offline instantaneo deshabilitado)' }
   W-Ok 'tareas creadas'
+
+  # Asegurar primer latido forzado para que aparezca "en linea" inmediatamente en la plataforma
+  try {
+    W-Log "Iniciando primer envio de metricas forzado..."
+    $metrics = Collect-Metrics
+    $res = Post-Json $Url $metrics
+    if ($res) { W-Ok 'Primer latido enviado y confirmado' }
+    else { W-Log 'aviso: primer latido no recibio respuesta (se intentara de nuevo en la tarea background)' }
+  } catch {
+    W-Log "aviso: error en primer latido forzado: $($_.Exception.Message)"
+  }
 
   W-Step 7 $total 'Iniciando agente en background...'
   & schtasks.exe /Run /TN $TaskName | Out-Null
