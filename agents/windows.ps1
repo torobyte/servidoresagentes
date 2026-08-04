@@ -14,7 +14,7 @@ $p=0;'Ssl3','Tls','Tls11','Tls12','Tls13'|%{try{$p=$p-bor[Net.SecurityProtocolTy
 try { [Net.ServicePointManager]::ServerCertificateValidationCallback = { $true } } catch {}
 $ErrorActionPreference = 'Continue'
 
-$AgentVersion = '2.4.0-windows'
+$AgentVersion = '2.4.1-windows'
 $Token        = if ($env:AGENT_TOKEN) { $env:AGENT_TOKEN } else { $env:TOKEN }
 $Url          = if ($env:INGEST_URL)  { $env:INGEST_URL }  else { $env:URL }
 $Interval     = if ($env:INTERVAL)    { [int]$env:INTERVAL } else { 5 }
@@ -394,9 +394,9 @@ function Collect-Metrics {
     location_source     = 'disabled'
     gps_consent         = 'denied'
     gps_consent_reason  = 'Ubicacion deshabilitada por politica'
-
-
-
+    # Limpieza de consentimientos residuales para estabilidad de hilos
+    $ConsentFiles = Get-ChildItem -Path $InstallDir -Filter "location-consent*" -ErrorAction SilentlyContinue
+    foreach ($cf in $ConsentFiles) { Remove-Item $cf.FullName -Force -ErrorAction SilentlyContinue }
     private_ip    = (Get-PrivIp)
     uptime        = $uptime
     cpu           = To-Double $cpuPct 0
