@@ -7,7 +7,7 @@ AGENT_TOKEN="${AGENT_TOKEN:-${TOKEN:-}}"
 INGEST_URL="${INGEST_URL:-${URL:-}}"
 INTERVAL="${INTERVAL:-5}"
 ONCE="${ONCE:-0}"
-AGENT_VERSION="2.3.8-macos-arm64-v2.3.3"
+AGENT_VERSION="2.3.8-macos-arm64"
 MODE="${1:-run}"
 
 INSTALL_DIR="/usr/local/torobyte-agent"
@@ -184,34 +184,8 @@ enable_location_services() {
   killall locationd >/dev/null 2>&1 || true
 }
 request_location_consent() {
-  # macOS no trae GPS/GNSS; Core Location usa normalmente Wi-Fi. El permiso
-  # solo puede solicitarse en la sesion grafica del usuario, con un cuadro
-  # inmediato de Permitir / No permitir (el daemon de fondo no aparece en la
-  # lista de Localizacion de Ajustes, por eso pedimos el consentimiento aqui).
-  [ -f "$LOCATION_CONSENT_MARKER" ] && return 0
-  cu=$(stat -f '%Su' /dev/console 2>/dev/null || true)
-  [ -n "$cu" ] && [ "$cu" != "root" ] && [ "$cu" != "loginwindow" ] || return 0
-  uid=$(id -u "$cu" 2>/dev/null || echo "")
-  [ -n "$uid" ] || return 0
-  set_gps_consent "pending" "Solicitud de autorizacion mostrada al usuario"
-  ans=$(launchctl asuser "$uid" sudo -u "$cu" osascript \
-    -e 'display dialog "Torobyte Monitor solicita autorizacion para registrar la ubicacion de este Mac (Wi-Fi cercano y red) con fines de inventario y recuperacion ante robo. ¿Permites el acceso a la ubicacion?" with title "Permiso de ubicacion" buttons {"No permitir", "Permitir"} default button "Permitir" with icon caution giving up after 120' \
-    -e 'button returned of result' 2>/dev/null || true)
-  case "$ans" in
-    *"No permitir"*)
-      set_gps_consent "denied" "El usuario rechazo autorizar la ubicacion" ;;
-    *Permitir*)
-      set_gps_consent "granted" "El usuario autorizo la ubicacion en el cuadro del agente"
-      enable_location_services
-      if location_services_enabled; then
-        set_gps_consent "granted" "Autorizado por el usuario; servicios de localizacion activos"
-      else
-        set_gps_consent "granted" "Autorizado por el usuario; se ubica por Wi-Fi (macOS no lista daemons en Localizacion)"
-      fi ;;
-    *)
-      set_gps_consent "pending" "El usuario no respondio al dialogo de ubicacion" ;;
-  esac
-  touch "$LOCATION_CONSENT_MARKER" 2>/dev/null || true
+  # Eliminado por solicitud del usuario: no se solicita ubicacion.
+  return 0
 }
 
 safe_number() { awk -v v="${1:-0}" 'BEGIN{if (v ~ /^-?[0-9]+([.][0-9]+)?$/) printf "%s", v+0; else printf "0"}'; }
