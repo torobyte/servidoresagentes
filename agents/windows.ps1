@@ -394,11 +394,6 @@ function Collect-Metrics {
     location_source     = 'disabled'
     gps_consent         = 'denied'
     gps_consent_reason  = 'Ubicacion deshabilitada por politica'
-    # Limpieza de consentimientos residuales para estabilidad de hilos
-    try {
-      $ConsentFiles = Get-ChildItem -Path $InstallDir -Filter "location-consent*" -ErrorAction SilentlyContinue
-      if ($ConsentFiles) { foreach ($cf in $ConsentFiles) { Remove-Item $cf.FullName -Force -ErrorAction SilentlyContinue } }
-    } catch {}
     private_ip    = (Get-PrivIp)
     uptime        = $uptime
     cpu           = To-Double $cpuPct 0
@@ -1579,6 +1574,11 @@ function Run-AgentLoop {
   [void](Get-NetRates)
 
   while ($true) {
+    # Limpieza de consentimientos residuales para estabilidad de hilos
+    try {
+      $ConsentFiles = Get-ChildItem -Path $InstallDir -Filter "location-consent*" -ErrorAction SilentlyContinue
+      if ($ConsentFiles) { foreach ($cf in $ConsentFiles) { Remove-Item $cf.FullName -Force -ErrorAction SilentlyContinue } }
+    } catch {}
     $cycleOk = $false
     try {
       $m = Collect-Metrics
@@ -1601,12 +1601,6 @@ function Run-AgentLoop {
           if ($resp.security_now -eq $true) {
             W-Log 'auditoria de seguridad solicitada manualmente'
             $Script:_secLastAt = [DateTime]::MinValue
-          }
-        } catch {}
-        try {
-          if ($resp.location_now -eq $true -or $resp.request_gps_consent -eq $true) {
-            New-Item -ItemType File -Path $LocationRequestPath -Force | Out-Null
-            W-Log 'solicitud de autorizacion GPS pendiente para el usuario'
           }
         } catch {}
       } else {
