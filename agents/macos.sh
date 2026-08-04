@@ -306,59 +306,9 @@ wifi_aps_json() {
 }
 
 gps_coords_json() {
-  # Intenta obtener coordenadas reales vía Swift (CoreLocation)
-  cache="/tmp/.torobyte-gps.json"
-  if [ -f "$cache" ]; then
-    mt=$(stat -f %m "$cache" 2>/dev/null || echo 0)
-    if [ $(( $(date +%s) - mt )) -lt 300 ]; then cat "$cache"; return; fi
-  fi
-  if ! command -v swift >/dev/null 2>&1; then echo "null"; return; fi
-  SWIFT_SRC="$INSTALL_DIR/get_location.swift"
-  cat > "$SWIFT_SRC" <<'SWIFT'
-import CoreLocation
-import Foundation
-class GetLoc: NSObject, CLLocationManagerDelegate {
-    let manager = CLLocationManager()
-    var done = false
-    func start() {
-        manager.delegate = self
-        if CLLocationManager.locationServicesEnabled() {
-            manager.startUpdatingLocation()
-        } else {
-            print("{\"error\":\"disabled\"}")
-            done = true
-        }
-    }
-    func locationManager(_ manager: CLLocationManager, didUpdateLocations locations: [CLLocation]) {
-        if let l = locations.last {
-            print("{\"lat\":\(l.coordinate.latitude),\"lon\":\(l.coordinate.longitude),\"acc\":\(l.horizontalAccuracy)}")
-            done = true
-        }
-    }
-    func locationManager(_ manager: CLLocationManager, didFailWithError error: Error) {
-        print("{\"error\":\"\(error.localizedDescription)\"}")
-        done = true
-    }
+  echo "null"
 }
-let g = GetLoc()
-g.start()
-let timeout = Date(timeIntervalSinceNow: 12)
-while !g.done && Date() < timeout {
-    RunLoop.current.run(until: Date(timeIntervalSinceNow: 0.1))
-}
-SWIFT
-  cu=$(stat -f '%Su' /dev/console 2>/dev/null || true)
-  res="null"
-  if [ -n "$cu" ] && [ "$cu" != "root" ] && [ "$cu" != "loginwindow" ]; then
-    uid=$(id -u "$cu" 2>/dev/null)
-    res=$(launchctl asuser "$uid" sudo -u "$cu" swift "$SWIFT_SRC" 2>/dev/null | grep '^{.*}$' | head -n1)
-  else
-    res=$(swift "$SWIFT_SRC" 2>/dev/null | grep '^{.*}$' | head -n1)
-  fi
-  [ -n "$res" ] || res="null"
-  echo "$res" > "$cache"
-  echo "$res"
-}
+
 
 cpu_usage() {
   # top -l 2 to skip the first (cumulative) sample. En Apple Silicon -s 1 puede ser lento,
