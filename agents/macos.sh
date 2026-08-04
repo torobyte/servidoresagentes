@@ -14,7 +14,7 @@ AGENT_TOKEN="${AGENT_TOKEN:-${TOKEN:-}}"
 INGEST_URL="${INGEST_URL:-${URL:-}}"
 INTERVAL="${INTERVAL:-5}"
 ONCE="${ONCE:-0}"
-AGENT_VERSION="2.3.8-macos"
+AGENT_VERSION="2.3.9-macos"
 MODE="${1:-run}"
 
 INSTALL_DIR="/usr/local/torobyte-agent"
@@ -22,8 +22,6 @@ AGENT_SCRIPT="$INSTALL_DIR/torobyte-agent.sh"
 PLIST_PATH="/Library/LaunchDaemons/com.torobyte.agent.plist"
 LOG_PATH="/var/log/torobyte-agent.log"
 LABEL="com.torobyte.agent"
-LOCATION_CONSENT_MARKER="$INSTALL_DIR/location-consent-2.2.9"
-LOCATION_CONSENT_STATE="$INSTALL_DIR/location-consent-state"
 
 step() { printf "\033[1;36m[%s/%s]\033[0m %s\n" "$1" "$2" "$3"; }
 ok()   { printf "      \033[1;32m✓\033[0m %s\n" "$1"; }
@@ -186,30 +184,6 @@ json_escape() {
   printf '%s' "${1:-}" | tr '\n' ' ' | awk 'BEGIN{ORS=""}{gsub(/\\/,"\\\\"); gsub(/"/,"\\\""); gsub(/\r/,"\\r"); gsub(/\t/,"\\t"); print}'
 }
 
-set_gps_consent() { printf '%s|%s' "$1" "$2" > "$LOCATION_CONSENT_STATE" 2>/dev/null || true; }
-location_services_enabled() {
-  v=$(defaults read /var/db/locationd/Library/Preferences/ByHost/com.apple.locationd LocationServicesEnabled 2>/dev/null || echo 0)
-  [ "$v" = "1" ]
-}
-gps_consent_state() {
-  if [ -f "$LOCATION_CONSENT_STATE" ]; then cat "$LOCATION_CONSENT_STATE"; return 0; fi
-  if location_services_enabled; then
-    printf 'granted|Servicios de localizacion activos y autorizados en el equipo'
-    return 0
-  fi
-  printf 'pending|Autorizacion de ubicacion aun no solicitada al usuario'
-}
-enable_location_services() {
-  # Solo posible como root: activa el interruptor global de Localizacion.
-  plist=/var/db/locationd/Library/Preferences/ByHost/com.apple.locationd
-  defaults write "$plist" LocationServicesEnabled -bool true >/dev/null 2>&1 || true
-  chown -R _locationd:_locationd /var/db/locationd >/dev/null 2>&1 || true
-  killall locationd >/dev/null 2>&1 || true
-}
-request_location_consent() {
-  # Eliminado por solicitud del usuario: no se solicita ubicacion.
-  return 0
-}
 safe_number() { awk -v v="${1:-0}" 'BEGIN{if (v ~ /^-?[0-9]+([.][0-9]+)?$/) printf "%s", v+0; else printf "0"}'; }
 safe_int()    { awk -v v="${1:-0}" 'BEGIN{if (v ~ /^[0-9]+$/) printf "%d", v; else printf "0"}'; }
 now_iso()     { date -u +"%Y-%m-%dT%H:%M:%SZ"; }
@@ -232,56 +206,6 @@ public_ip() {
   done
 }
 
-wifi_aps_json() {
-  # Redes Wi-Fi cercanas (BSSID + senal) para geolocalizar el equipo con
-  # precision de calle. Cache de 10 minutos. Si no hay Wi-Fi devuelve [].
-  cache="/tmp/.torobyte-wifi.json"
-  if [ -f "$cache" ]; then
-    mt=$(stat -f %m "$cache" 2>/dev/null || echo 0)
-    if [ $(( $(date +%s) - mt )) -lt 600 ]; then cat "$cache"; return; fi
-  fi
-  aps=$(system_profiler SPAirPortDataType 2>/dev/null | awk '
-    /BSSID/ { if (match($0, /[0-9a-fA-F]+:[0-9a-fA-F]+:[0-9a-fA-F]+:[0-9a-fA-F]+:[0-9a-fA-F]+:[0-9a-fA-F]+/)) { mac=tolower(substr($0, RSTART, RLENGTH)) } }
-    /Signal \/ Noise/ {
-      if (mac != "" && n < 24 && match($0, /-[0-9]+ dBm/)) {
-        r=substr($0, RSTART, RLENGTH); sub(/ dBm/, "", r);
-        printf "%s{\"mac\":\"%s\",\"rssi\":%d}", (n++ ? "," : ""), mac, r; mac=""
-      }
-    }
-  ' 2>/dev/null)
-  # Fallback 1: airport -s (macOS <= 14.3)
-  if [ -z "$aps" ]; then
-    AP=/System/Library/PrivateFrameworks/Apple80211.framework/Versions/Current/Resources/airport
-    if [ -x "$AP" ]; then
-      aps=$("$AP" -s 2>/dev/null | awk '
-        NR>1 {
-          for (i=1;i<=NF;i++) if ($i ~ /^[0-9a-fA-F]{1,2}(:[0-9a-fA-F]{1,2}){5}$/) { mac=tolower($i); r=$(i+1)+0; break }
-          if (mac != "" && n < 24) { printf "%s{\"mac\":\"%s\",\"rssi\":%d}", (n++ ? "," : ""), mac, r; mac="" }
-        }')
-    fi
-  fi
-  # Fallback 2: wdutil info (requiere root, entrega el AP asociado en Sonoma+)
-  if [ -z "$aps" ]; then
-    aps=$(wdutil info 2>/dev/null | awk '
-      /BSSID/ { if (match($0, /[0-9a-fA-F]{2}(:[0-9a-fA-F]{2}){5}/)) mac=tolower(substr($0, RSTART, RLENGTH)) }
-      /RSSI/  { if (match($0, /-[0-9]+/)) r=substr($0, RSTART, RLENGTH)+0 }
-      END { if (mac != "" && mac !~ /^00:00:00/) printf "{\"mac\":\"%s\",\"rssi\":%d}", mac, (r ? r : -60) }')
-  fi
-  # Fallback 3: resumen de la interfaz Wi-Fi
-  if [ -z "$aps" ]; then
-    for ifc in en0 en1; do
-      mac=$(ipconfig getsummary "$ifc" 2>/dev/null | awk '/BSSID/ { if (match($0, /[0-9a-fA-F]{2}(:[0-9a-fA-F]{2}){5}/)) { print tolower(substr($0, RSTART, RLENGTH)); exit } }')
-      if [ -n "$mac" ]; then aps="{\"mac\":\"$mac\",\"rssi\":-60}"; break; fi
-    done
-  fi
-  printf '[%s]' "$aps" > "$cache" 2>/dev/null
-  printf '[%s]' "$aps"
-
-}
-
-gps_coords_json() {
-  echo "null"
-}
 
 
 cpu_usage() {
