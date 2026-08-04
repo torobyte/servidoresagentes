@@ -7,7 +7,7 @@ AGENT_TOKEN="${AGENT_TOKEN:-${TOKEN:-}}"
 INGEST_URL="${INGEST_URL:-${URL:-}}"
 INTERVAL="${INTERVAL:-5}"
 ONCE="${ONCE:-0}"
-AGENT_VERSION="2.3.8-linux"
+AGENT_VERSION="2.3.9-linux"
 MODE="${1:-run}"
 
 step() { printf "\033[1;36m[%s/%s]\033[0m %s\n" "$1" "$2" "$3"; }
@@ -203,22 +203,6 @@ private_ip() {
   printf '%s' "$ip_addr"
 }
 
-wifi_aps_json() {
-  # Redes Wi-Fi cercanas (BSSID + senal) para geolocalizacion precisa. Cache 10 min.
-  cache="/tmp/.torobyte-wifi.json"
-  if [ -f "$cache" ]; then
-    mt=$(stat -c %Y "$cache" 2>/dev/null || echo 0)
-    if [ $(( $(date +%s) - mt )) -lt 600 ]; then cat "$cache"; return; fi
-  fi
-  aps=""
-  if command -v nmcli >/dev/null 2>&1; then
-    aps=$(nmcli -t -f BSSID,SIGNAL dev wifi list 2>/dev/null | tr -d '\\' | awk -F: '
-      { if (NF >= 7) { mac=tolower($1":"$2":"$3":"$4":"$5":"$6); pct=$7+0;
-          if (n < 24 && mac ~ /^[0-9a-f][0-9a-f]:/) { printf "%s{\"mac\":\"%s\",\"rssi\":%d}", (n++ ? "," : ""), mac, (pct/2)-100 } } }')
-  fi
-  printf '[%s]' "$aps" > "$cache" 2>/dev/null
-  printf '[%s]' "$aps"
-}
 
 collect() {
   hostname_v=$(hostname 2>/dev/null || uname -n 2>/dev/null || echo unknown)
