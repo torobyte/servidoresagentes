@@ -346,38 +346,9 @@ function Request-UserLocationConsent {
 
 
 function Get-NativeGeo {
-  # Ubicacion nativa de Windows (GNSS si existe, si no trilateracion Wi-Fi del
-  # propio sistema operativo). Mucho mas precisa que la geo-IP.
-  # Cache 5 minutos. Devuelve $null si no se pudo obtener.
-  if ($Script:_geoFix -and $Script:_geoFixAt -and ((Get-Date) - $Script:_geoFixAt).TotalMinutes -lt 5) {
-    return $Script:_geoFix
-  }
-  $fix = $null
-  try {
-    Enable-LocationService
-    Add-Type -AssemblyName System.Runtime.WindowsRuntime -ErrorAction SilentlyContinue
-    $geo = New-Object Windows.Devices.Geolocation.Geolocator -ErrorAction SilentlyContinue
-    if ($geo) {
-      $geo.DesiredAccuracyInMeters = 50
-      $op = $geo.GetGeopositionAsync()
-      $sw = [Diagnostics.Stopwatch]::StartNew()
-      while ($op.Status -eq 0 -and $sw.Elapsed.TotalSeconds -lt 20) { Start-Sleep -Milliseconds 250 }
-      if ($op.Status -eq 1) {
-        $p = $op.GetResults().Coordinate
-        if ($p -and $p.Point) {
-          $fix = [pscustomobject]@{
-            lat = [double]$p.Point.Position.Latitude
-            lon = [double]$p.Point.Position.Longitude
-            acc = $(if ($p.Accuracy) { [double]$p.Accuracy } else { 60 })
-            src = $(if ("$($p.PositionSource)" -match '(?i)satellite') { 'gps' } else { 'wifi' })
-          }
-        }
-      }
-    }
-  } catch { $fix = $null }
-  if ($fix) { $Script:_geoFix = $fix; $Script:_geoFixAt = Get-Date }
-  return $fix
+  return $null
 }
+
 
 
 function Get-PubIp {
