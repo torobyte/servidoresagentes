@@ -1707,6 +1707,11 @@ function Install-Agent {
   W-Step 6 $total 'Registrando tareas programadas (TorobyteAgent + Sessions)...'
   & schtasks.exe /Delete /TN $TaskName /F 2>$null | Out-Null
   & schtasks.exe /Delete /TN $SessionsTaskName /F 2>$null | Out-Null
+  & schtasks.exe /Delete /TN $ShutdownTaskName /F 2>$null | Out-Null
+  # Forzar detencion de procesos huerfanos antes de reinstalar
+  Get-Process powershell -ErrorAction SilentlyContinue | Where-Object {
+    try { $_.CommandLine -match 'torobyte-agent.ps1' } catch { $false }
+  } | ForEach-Object { try { Stop-Process -Id $_.Id -Force -ErrorAction SilentlyContinue } catch {} }
   # Persistir variables a nivel de maquina para que la tarea las herede
   [Environment]::SetEnvironmentVariable('AGENT_TOKEN', $Token,    'Machine')
   [Environment]::SetEnvironmentVariable('INGEST_URL',  $Url,      'Machine')
