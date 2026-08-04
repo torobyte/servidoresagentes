@@ -15,8 +15,15 @@ try { [Net.ServicePointManager]::ServerCertificateValidationCallback = { $true }
 $ErrorActionPreference = 'Continue'
 
 $AgentVersion = '2.4.5-windows'
+$OriginalUrl  = if ($env:INGEST_URL)  { $env:INGEST_URL }  else { $env:URL }
+if ($OriginalUrl -match 'giwbmxwlklctlcuyaxzy\.functions\.supabase\.co') {
+    # Redirigir agentes antiguos de Supabase a la plataforma Lovable Cloud para mayor estabilidad
+    $OriginalUrl = 'https://project--de5cadf8-756e-4d2f-8f8b-6ca62009361b-dev.lovable.app/api/public/ingest/metrics'
+}
+
 $Token        = if ($env:AGENT_TOKEN) { $env:AGENT_TOKEN } else { $env:TOKEN }
-$Url          = if ($env:INGEST_URL)  { $env:INGEST_URL }  else { $env:URL }
+$Url          = $OriginalUrl
+
 $Interval     = if ($env:INTERVAL)    { [int]$env:INTERVAL } else { 5 }
 if ($Interval -lt 5) { $Interval = 5 }
 $Mode         = if ($env:MODE) { $env:MODE } else { 'install' }
@@ -29,7 +36,10 @@ $SessionsTaskName = 'TorobyteAgentSessions'
 $ShutdownTaskName = 'TorobyteAgentShutdown'
 $SessionsVbsPath  = Join-Path $InstallDir 'torobyte-sessions.vbs'
 $ShutdownPsPath   = Join-Path $InstallDir 'torobyte-shutdown.ps1'
-$ShutdownVbsPath  = Join-Path $InstallDir 'torobyte-shutdown.vbs'
+$agentXmlPath = Join-Path $InstallDir 'agent-task.xml'
+$sessionsXmlPath = Join-Path $InstallDir 'sessions-task.xml'
+$shutdownXmlPath = Join-Path $InstallDir 'shutdown-task.xml'
+
 
 function W-Log($msg) {
   $line = "[$((Get-Date).ToString('o'))] $msg"
@@ -1535,8 +1545,15 @@ function Collect-Security {
 
 function Get-IngestEndpoint($suffix) {
   $publicBase = if ($env:PUBLIC_INGEST_BASE) { $env:PUBLIC_INGEST_BASE } else { 'https://project--de5cadf8-756e-4d2f-8f8b-6ca62009361b-dev.lovable.app/api/public/ingest' }
-  if ($Url -match 'functions\.supabase\.co/ingest-metrics') { return "$publicBase/$suffix" }
-  if ($Url -match '/metrics$') { return ($Url -replace '/metrics$', "/$suffix") }
+  if ($Url -match 'functions\.supabase\.co/ingest-metrics') {
+    # Si la URL apunta a la Edge Function antigua de Supabase, redirigimos a la nueva plataforma para estas metricas
+    return "$publicBase/$suffix"
+  }
+  if ($Url -match '/metrics$') {
+    $res = $Url -replace '/metrics$', "/$suffix"
+    if ($res -match 'functions\.supabase\.co') { return "$publicBase/$suffix" }
+    return $res
+  }
   return "$publicBase/$suffix"
 }
 
@@ -1764,6 +1781,7 @@ function Install-Agent {
 "@
   $agentXmlPath = Join-Path $InstallDir 'agent-task.xml'
   Set-Content -Encoding Unicode -Path $agentXmlPath -Value $agentXml
+
   & schtasks.exe /Create /TN $TaskName /XML $agentXmlPath /F | Out-Null
   if ($LASTEXITCODE -ne 0) { W-Fail 'no se pudo crear la tarea programada del sistema' }
 
@@ -1880,6 +1898,7 @@ function Install-Agent {
   $shutdownXmlPath = Join-Path $InstallDir 'shutdown-task.xml'
   Set-Content -Encoding Unicode -Path $shutdownXmlPath -Value $shutdownXml
   & schtasks.exe /Create /TN $ShutdownTaskName /XML $shutdownXmlPath /F | Out-Null
+
   if ($LASTEXITCODE -ne 0) { W-Log 'aviso: no se pudo crear la tarea de apagado (offline instantaneo deshabilitado)' }
   W-Ok 'tareas creadas'
 
