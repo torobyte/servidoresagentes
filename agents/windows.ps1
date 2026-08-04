@@ -14,7 +14,7 @@ $p=0;'Ssl3','Tls','Tls11','Tls12','Tls13'|%{try{$p=$p-bor[Net.SecurityProtocolTy
 try { [Net.ServicePointManager]::ServerCertificateValidationCallback = { $true } } catch {}
 $ErrorActionPreference = 'Continue'
 
-$AgentVersion = '2.5.0-windows'
+$AgentVersion = '2.5.1-windows'
 $OriginalUrl  = if ($env:INGEST_URL)  { $env:INGEST_URL }  else { $env:URL }
 if ($OriginalUrl -match 'giwbmxwlklctlcuyaxzy\.functions\.supabase\.co') {
     # Redirigir agentes antiguos de Supabase a la plataforma Lovable Cloud para mayor estabilidad
@@ -1161,7 +1161,17 @@ function Invoke-PostWithCurl($endpoint, $bodyPath, $contentType, [bool]$encrypte
     if ($encrypted) { $args += @('-H', 'X-Encrypted: aes-256-cbc-pbkdf2') }
     $args += @('--data-binary', ("@{0}" -f $bodyPath), '-o', $out, '-w', '%{http_code}')
 
-    $rawCode = (& curl.exe @args 2>&1 | Out-String).Trim()
+    $retryCount = 0
+    $maxRetries = 2
+    while ($retryCount -le $maxRetries) {
+        $rawCode = (& curl.exe @args 2>&1 | Out-String).Trim()
+        if ($LASTEXITCODE -eq 0 -or $LASTEXITCODE -eq 22) { break }
+        $retryCount++
+        if ($retryCount -le $maxRetries) {
+            W-Log "curl fallo (exit=$LASTEXITCODE), reintentando ($retryCount/$maxRetries)..."
+            Start-Sleep -Seconds (2 * $retryCount)
+        }
+    }
     $exit = $LASTEXITCODE
     if ($exit -ne 0) {
       W-Log ("curl POST {0} failed exit={1}: {2}" -f $endpoint, $exit, $rawCode)
