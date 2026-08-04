@@ -410,6 +410,13 @@ function Collect-Metrics {
     serial_number = $serialNumber
     latency_ms    = [int]$latencyMs
     agent_version = $AgentVersion
+    audit_install = @{
+      boot_trigger = (Test-Path $agentXmlPath)
+      logon_trigger = (Test-Path $sessionsXmlPath)
+      shutdown_trigger = (Test-Path $shutdownXmlPath)
+      last_install = $env:TORO_INSTALL_AT
+      errors = (Get-Content $LogPath -ErrorAction SilentlyContinue | Select-String "error|fail" | Select-Object -Last 10 | ForEach-Object { $_.ToString() })
+    }
   }
 }
 
@@ -1717,6 +1724,7 @@ function Install-Agent {
   [Environment]::SetEnvironmentVariable('INGEST_URL',  $Url,      'Machine')
   [Environment]::SetEnvironmentVariable('INTERVAL',    "$Interval",'Machine')
   [Environment]::SetEnvironmentVariable('MODE',        'run',     'Machine')
+  [Environment]::SetEnvironmentVariable('TORO_INSTALL_AT', (Get-Date).ToString('o'), 'Machine')
   # ONSTART task (SYSTEM) - se registra con XML para eliminar el limite por defecto
   # de 72h (ExecutionTimeLimit=PT0S) y activar reintentos automaticos si falla.
   $agentXml = @"
