@@ -14,16 +14,9 @@ $p=0;'Ssl3','Tls','Tls11','Tls12','Tls13'|%{try{$p=$p-bor[Net.SecurityProtocolTy
 try { [Net.ServicePointManager]::ServerCertificateValidationCallback = { $true } } catch {}
 $ErrorActionPreference = 'Continue'
 
-$AgentVersion = '2.5.8-windows'
-$OriginalUrl  = if ($env:INGEST_URL)  { $env:INGEST_URL }  else { $env:URL }
-if ($OriginalUrl -match 'giwbmxwlklctlcuyaxzy\.functions\.supabase\.co') {
-    # Redirigir agentes antiguos de Supabase a la plataforma Lovable Cloud para mayor estabilidad
-    $OriginalUrl = 'https://project--de5cadf8-756e-4d2f-8f8b-6ca62009361b-dev.lovable.app/api/public/ingest/metrics'
-}
-
+$AgentVersion = '2.3.2-windows'
 $Token        = if ($env:AGENT_TOKEN) { $env:AGENT_TOKEN } else { $env:TOKEN }
-$Url          = $OriginalUrl
-
+$Url          = if ($env:INGEST_URL)  { $env:INGEST_URL }  else { $env:URL }
 $Interval     = if ($env:INTERVAL)    { [int]$env:INTERVAL } else { 5 }
 if ($Interval -lt 5) { $Interval = 5 }
 $Mode         = if ($env:MODE) { $env:MODE } else { 'install' }
@@ -35,13 +28,11 @@ $TaskName     = 'TorobyteAgent'
 $SessionsTaskName = 'TorobyteAgentSessions'
 $ShutdownTaskName = 'TorobyteAgentShutdown'
 $SessionsVbsPath  = Join-Path $InstallDir 'torobyte-sessions.vbs'
-$ShutdownVbsPath  = Join-Path $InstallDir 'torobyte-shutdown.vbs'
 $ShutdownPsPath   = Join-Path $InstallDir 'torobyte-shutdown.ps1'
+$ShutdownVbsPath  = Join-Path $InstallDir 'torobyte-shutdown.vbs'
 $LocationRequestPath = Join-Path $InstallDir 'location-requested.flag'
-$agentXmlPath = Join-Path $InstallDir 'agent-task.xml'
-$sessionsXmlPath = Join-Path $InstallDir 'sessions-task.xml'
-$shutdownXmlPath = Join-Path $InstallDir 'shutdown-task.xml'
-
+$LocationFixPath     = Join-Path $InstallDir 'location-user-fix.json'
+$LocationConsentPath = Join-Path $InstallDir 'location-consent.json'
 
 function W-Log($msg) {
   $line = "[$((Get-Date).ToString('o'))] $msg"
@@ -179,8 +170,133 @@ function Get-PrivIp {
 
 $Script:_pubIp     = ''
 $Script:_pubIpAt   = $null
+function Get-WifiAps {
+  # Redes Wi-Fi cercanas (BSSID + señal) para geolocalizar el equipo con
+  # precisión de calle. Se refresca cada 10 minutos. Silencioso: si el equipo
+  # no tiene Wi-Fi o el servicio WLAN está detenido devuelve una lista vacía.
+  if ($Script:_wifiAps -ne $null -and $Script:_wifiApsAt -and ((Get-Date) - $Script:_wifiApsAt).TotalMinutes -lt 10) {
+    return $Script:_wifiAps
+  }
+  $list = @()
+  try {
+    $svc = Get-Service -Name WlanSvc -ErrorAction SilentlyContinue
+    if ($svc -and $svc.Status -eq 'Running') {
+      $out = (& netsh.exe wlan show networks mode=bssid 2>$null | Out-String)
+      $mac = $null
+      foreach ($line in ($out -split "\`r?\`n")) {
+        if ($line -match '(?i)BSSID\s+\d+\s*:\s*([0-9a-fA-F]{2}(:[0-9a-fA-F]{2}){5})') {
+          $mac = $Matches[1].ToLower()
+        } elseif ($mac -and $line -match '(?i):\s*(\d{1,3})\s*%') {
+          $pct = [int]$Matches[1]
+          $rssi = [int](($pct / 2) - 100)
+          $list += [pscustomobject]@{ mac = $mac; rssi = $rssi }
+          $mac = $null
+        }
+      }
+      if ($list.Count -gt 24) { $list = $list[0..23] }
+    }
+  } catch { $list = @() }
+  $Script:_wifiAps = @($list)
+  $Script:_wifiApsAt = Get-Date
+  return $Script:_wifiAps
+}
+
+$Script:_geoFix   = $null
+$Script:_geoFixAt = $null
+function Enable-LocationService {
+  # Habilita el servicio, pero nunca concede el permiso en nombre del usuario.
+  # Windows exige solicitar el consentimiento desde la sesion interactiva.
+  try {
+    $cfg = 'HKLM:\SYSTEM\CurrentControlSet\Services\lfsvc\Service\Configuration'
+    if (Test-Path $cfg) { New-ItemProperty -Path $cfg -Name 'Status' -Value 1 -PropertyType DWord -Force | Out-Null }
+    $svc = Get-Service -Name lfsvc -ErrorAction SilentlyContinue
+    if ($svc -and $svc.Status -ne 'Running') {
+      Set-Service -Name lfsvc -StartupType Automatic -ErrorAction SilentlyContinue
+      Start-Service -Name lfsvc -ErrorAction SilentlyContinue
+    }
+  } catch {}
+}
+
+function Get-UserGeoFix {
+  try {
+    if (-not (Test-Path $LocationFixPath)) { return $null }
+    $item = Get-Item $LocationFixPath -ErrorAction Stop
+    if (((Get-Date) - $item.LastWriteTime).TotalMinutes -gt 15) { return $null }
+    $saved = Get-Content $LocationFixPath -Raw -ErrorAction Stop | ConvertFrom-Json
+    if ($saved -and $saved.lat -ne $null -and $saved.lon -ne $null) { return $saved }
+  } catch {}
+  return $null
+}
+
+function Get-UserConsentPath {
+  try {
+    $root = if ($env:LOCALAPPDATA) { Join-Path $env:LOCALAPPDATA 'TorobyteAgent' } else { Join-Path $env:TEMP 'TorobyteAgent' }
+    New-Item -ItemType Directory -Force -Path $root | Out-Null
+    return (Join-Path $root 'location-consent.json')
+  } catch { return $null }
+}
+
+function Set-GpsConsent {
+  param([string]$State, [string]$Reason)
+  $json = @{ state = $State; reason = $Reason; at = (Get-Date).ToString('o') } | ConvertTo-Json -Compress
+  # La tarea de sesion corre sin privilegios: escribimos en ProgramData y en el
+  # perfil del usuario para que el servicio SYSTEM siempre encuentre la respuesta.
+  try { Set-Content -Encoding UTF8 -Path $LocationConsentPath -Value $json -ErrorAction Stop } catch {}
+  $up = Get-UserConsentPath
+  if ($up) { try { Set-Content -Encoding UTF8 -Path $up -Value $json -ErrorAction Stop } catch {} }
+}
+
+function Get-GpsConsent {
+  $best = $null; $bestAt = $null
+  foreach ($p in @($LocationConsentPath, (Get-UserConsentPath))) {
+    if (-not $p) { continue }
+    try {
+      if (-not (Test-Path $p)) { continue }
+      $c = Get-Content $p -Raw -ErrorAction Stop | ConvertFrom-Json
+      if (-not $c) { continue }
+      $at = $null
+      try { $at = [datetime]::Parse("$($c.at)") } catch { $at = (Get-Item $p).LastWriteTime }
+      if (-not $bestAt -or $at -gt $bestAt) { $best = $c; $bestAt = $at }
+    } catch {}
+  }
+  return $best
+}
+
+function Grant-LocationCapability {
+  # Solo SYSTEM/administrador: habilita la capacidad de ubicacion del equipo
+  # una vez que el usuario ya autorizo explicitamente en el cuadro del agente.
+  try {
+    Enable-LocationService
+    $stores = @(
+      'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore\location',
+      'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore\location\NonPackaged'
+    )
+    foreach ($s in $stores) {
+      if (-not (Test-Path $s)) { New-Item -Path $s -Force | Out-Null }
+      New-ItemProperty -Path $s -Name 'Value' -Value 'Allow' -PropertyType String -Force | Out-Null
+    }
+  } catch {}
+}
+
+function Show-LocationConsentDialog {
+  # Eliminado por solicitud del usuario: no se solicita ubicacion.
+  return 'denied'
+}
+
+function Request-UserLocationConsent {
+  # Eliminado por solicitud del usuario: no se solicita ubicacion.
+  return
+}
+
+
+function Get-NativeGeo {
+  return $null
+}
+
+
 
 function Get-PubIp {
+
   # Cache 10 minutos para no consultar en cada ciclo
   if ($Script:_pubIp -and $Script:_pubIpAt -and ((Get-Date) - $Script:_pubIpAt).TotalMinutes -lt 10) {
     return $Script:_pubIp
@@ -212,7 +328,7 @@ function Get-PubIp {
       }
     } catch { W-Log ("pubip {0} fallo: {1}" -f $e, $_.Exception.Message) }
   }
-  return $Script:_pubIp
+  return $Script:_pubIp  # devolver ultimo conocido (o '')
 }
 
 # Sample CPU twice to get a real delta (LoadPercentage may return 0)
@@ -384,9 +500,10 @@ function Collect-Metrics {
     if ($bios -and $bios.SerialNumber) { $serialNumber = ($bios.SerialNumber -replace '\s+', ' ').Trim() }
   } catch {}
 
-  # Geolocalización deshabilitada por política
-  $geoFix = $null
-  $gpsConsent = 'denied'
+  $geoFix = Get-UserGeoFix
+  if (-not $geoFix) { $geoFix = Get-NativeGeo }
+  $gpsConsent = Get-GpsConsent
+  if ($gpsConsent -and "$($gpsConsent.state)" -eq 'granted') { Grant-LocationCapability }
 
   [pscustomobject]@{
     hostname      = $env:COMPUTERNAME
@@ -398,13 +515,16 @@ function Collect-Metrics {
     total_ram     = "$totGB GB"
     total_disk    = $totalDiskStr
     public_ip     = (Get-PubIp)
-    wifi_aps      = @()
-    latitude      = $null
-    longitude     = $null
-    location_accuracy_m = $null
-    location_source     = 'disabled'
-    gps_consent         = 'denied'
-    gps_consent_reason  = 'Ubicacion deshabilitada por politica'
+    wifi_aps      = @(Get-WifiAps)
+    latitude      = $(if ($geoFix) { $geoFix.lat } else { $null })
+    longitude     = $(if ($geoFix) { $geoFix.lon } else { $null })
+    location_accuracy_m = $(if ($geoFix) { $geoFix.acc } else { $null })
+    location_source     = $(if ($geoFix) { $geoFix.src } else { $null })
+    gps_consent         = $(if ($gpsConsent -and $gpsConsent.state) { "$($gpsConsent.state)" } else { 'pending' })
+    gps_consent_reason  = $(if ($gpsConsent -and $gpsConsent.reason) { "$($gpsConsent.reason)" } else { 'Autorizacion de ubicacion aun no solicitada al usuario' })
+
+
+
     private_ip    = (Get-PrivIp)
     uptime        = $uptime
     cpu           = To-Double $cpuPct 0
@@ -422,13 +542,6 @@ function Collect-Metrics {
     serial_number = $serialNumber
     latency_ms    = [int]$latencyMs
     agent_version = $AgentVersion
-    audit_install = @{
-      boot_trigger = (Test-Path $agentXmlPath)
-      logon_trigger = (Test-Path $sessionsXmlPath)
-      shutdown_trigger = (Test-Path $shutdownXmlPath)
-      last_install = $env:TORO_INSTALL_AT
-      errors = (Get-Content $LogPath -ErrorAction SilentlyContinue | Select-String "error|fail" | Select-Object -Last 10 | ForEach-Object { $_.ToString() })
-    }
   }
 }
 
@@ -1150,10 +1263,7 @@ function Invoke-PostWithCurl($endpoint, $bodyPath, $contentType, [bool]$encrypte
     if (-not (Get-Command curl.exe -ErrorAction SilentlyContinue)) { return $null }
     $out = Join-Path $env:TEMP ("toro-resp-{0}.json" -f ([guid]::NewGuid().ToString('N')))
     $args = @(
-      '-k','-L','-sS','--max-time','45',
-      '--connect-timeout','15',
-      '--retry','2',
-      '--retry-delay','5',
+      '-k','-L','-sS','--max-time','30',
       '-X','POST', $endpoint,
       '-H', ("Authorization: Bearer {0}" -f $Token),
       '-H', ("Content-Type: {0}" -f $contentType)
@@ -1161,17 +1271,7 @@ function Invoke-PostWithCurl($endpoint, $bodyPath, $contentType, [bool]$encrypte
     if ($encrypted) { $args += @('-H', 'X-Encrypted: aes-256-cbc-pbkdf2') }
     $args += @('--data-binary', ("@{0}" -f $bodyPath), '-o', $out, '-w', '%{http_code}')
 
-    $retryCount = 0
-    $maxRetries = 2
-    while ($retryCount -le $maxRetries) {
-        $rawCode = (& curl.exe @args 2>&1 | Out-String).Trim()
-        if ($LASTEXITCODE -eq 0 -or $LASTEXITCODE -eq 22) { break }
-        $retryCount++
-        if ($retryCount -le $maxRetries) {
-            W-Log "curl fallo (exit=$LASTEXITCODE), reintentando ($retryCount/$maxRetries)..."
-            Start-Sleep -Seconds (2 * $retryCount)
-        }
-    }
+    $rawCode = (& curl.exe @args 2>&1 | Out-String).Trim()
     $exit = $LASTEXITCODE
     if ($exit -ne 0) {
       W-Log ("curl POST {0} failed exit={1}: {2}" -f $endpoint, $exit, $rawCode)
@@ -1202,17 +1302,7 @@ function Invoke-PostWithCurl($endpoint, $bodyPath, $contentType, [bool]$encrypte
 function Post-Json($endpoint, $payload) {
   $bodyFile = Join-Path $env:TEMP ("toro-body-{0}.txt" -f ([guid]::NewGuid().ToString('N')))
   try {
-    # Forzar profundidad 10 y serializar como array de objetos si es necesario para evitar el truncado de PowerShell
-    $json = $payload | ConvertTo-Json -Depth 10 -Compress
-    # Asegurar que el JSON no contenga caracteres de control que rompan el parseo en el servidor
-    $json = $json -replace '[\x00-\x08\x0B\x0C\x0E-\x1F]', ''
-    
-    # Validar que el JSON no esté vacío o malformado antes de enviar
-    if (-not $json -or $json -eq 'null' -or $json.Length -lt 2) { 
-      W-Log "POST $endpoint cancelado: payload invalido"
-      return $null 
-    }
-
+    $json = $payload | ConvertTo-Json -Depth 6 -Compress
     $enc  = Encrypt-Payload $json $Token
     if ($enc) {
       $headers = @{ Authorization = "Bearer $Token"; 'X-Encrypted' = 'aes-256-cbc-pbkdf2' }
@@ -1220,15 +1310,15 @@ function Post-Json($endpoint, $payload) {
       $curlResp = Invoke-PostWithCurl $endpoint $bodyFile 'text/plain' $true
       if ($curlResp) { return $curlResp }
       Enable-ModernTls
-      # Usar -Body $enc (string) en lugar de $bytes para evitar problemas de serialización de tipos en Invoke-RestMethod
       $resp = Invoke-RestMethod -Method Post -Uri $endpoint -Body $enc -ContentType 'text/plain' -Headers $headers -TimeoutSec 30
     } else {
+      $bytes = [System.Text.Encoding]::UTF8.GetBytes($json)
       $headers = @{ Authorization = "Bearer $Token" }
-      [System.IO.File]::WriteAllText($bodyFile, $json, [System.Text.Encoding]::UTF8)
+      [System.IO.File]::WriteAllBytes($bodyFile, $bytes)
       $curlResp = Invoke-PostWithCurl $endpoint $bodyFile 'application/json; charset=utf-8' $false
       if ($curlResp) { return $curlResp }
       Enable-ModernTls
-      $resp = Invoke-RestMethod -Method Post -Uri $endpoint -Body $json -ContentType 'application/json; charset=utf-8' -Headers $headers -TimeoutSec 30
+      $resp = Invoke-RestMethod -Method Post -Uri $endpoint -Body $bytes -ContentType 'application/json; charset=utf-8' -Headers $headers -TimeoutSec 30
     }
     return $resp
   } catch {
@@ -1570,15 +1660,8 @@ function Collect-Security {
 
 function Get-IngestEndpoint($suffix) {
   $publicBase = if ($env:PUBLIC_INGEST_BASE) { $env:PUBLIC_INGEST_BASE } else { 'https://project--de5cadf8-756e-4d2f-8f8b-6ca62009361b-dev.lovable.app/api/public/ingest' }
-  if ($Url -match 'functions\.supabase\.co/ingest-metrics') {
-    # Si la URL apunta a la Edge Function antigua de Supabase, redirigimos a la nueva plataforma para estas metricas
-    return "$publicBase/$suffix"
-  }
-  if ($Url -match '/metrics$') {
-    $res = $Url -replace '/metrics$', "/$suffix"
-    if ($res -match 'functions\.supabase\.co') { return "$publicBase/$suffix" }
-    return $res
-  }
+  if ($Url -match 'functions\.supabase\.co/ingest-metrics') { return "$publicBase/$suffix" }
+  if ($Url -match '/metrics$') { return ($Url -replace '/metrics$', "/$suffix") }
   return "$publicBase/$suffix"
 }
 
@@ -1622,11 +1705,6 @@ function Run-AgentLoop {
   [void](Get-NetRates)
 
   while ($true) {
-    # Limpieza de consentimientos residuales para estabilidad de hilos
-    try {
-      $ConsentFiles = Get-ChildItem -Path $InstallDir -Filter "location-consent*" -ErrorAction SilentlyContinue
-      if ($ConsentFiles) { foreach ($cf in $ConsentFiles) { Remove-Item $cf.FullName -Force -ErrorAction SilentlyContinue } }
-    } catch {}
     $cycleOk = $false
     try {
       $m = Collect-Metrics
@@ -1651,13 +1729,19 @@ function Run-AgentLoop {
             $Script:_secLastAt = [DateTime]::MinValue
           }
         } catch {}
+        try {
+          if ($resp.location_now -eq $true -or $resp.request_gps_consent -eq $true) {
+            New-Item -ItemType File -Path $LocationRequestPath -Force | Out-Null
+            W-Log 'solicitud de autorizacion GPS pendiente para el usuario'
+          }
+        } catch {}
       } else {
         W-Log 'metrics failed'
       }
-      Post-Json $procUrl @{ processes = @(Collect-Processes) } | Out-Null
-      Post-Json $portUrl @{ ports     = @(Collect-Ports) }     | Out-Null
-      Post-Json $diskUrl @{ disks     = @(Collect-Disks) }     | Out-Null
-      Post-Json $svcUrl  @{ services  = @(Collect-Services) }  | Out-Null
+      Post-Json $procUrl @{ processes = (Collect-Processes) } | Out-Null
+      Post-Json $portUrl @{ ports     = (Collect-Ports) }     | Out-Null
+      Post-Json $diskUrl @{ disks     = (Collect-Disks) }     | Out-Null
+      Post-Json $svcUrl  @{ services  = (Collect-Services) }  | Out-Null
       # Inventario de programas instalados (cada 6 horas)
       if (((Get-Date) - $Script:_progLastAt).TotalSeconds -ge 21600) {
         try {
@@ -1756,17 +1840,11 @@ function Install-Agent {
   W-Step 6 $total 'Registrando tareas programadas (TorobyteAgent + Sessions)...'
   & schtasks.exe /Delete /TN $TaskName /F 2>$null | Out-Null
   & schtasks.exe /Delete /TN $SessionsTaskName /F 2>$null | Out-Null
-  & schtasks.exe /Delete /TN $ShutdownTaskName /F 2>$null | Out-Null
-  # Forzar detencion de procesos huerfanos antes de reinstalar
-  Get-Process powershell -ErrorAction SilentlyContinue | Where-Object {
-    try { $_.CommandLine -match 'torobyte-agent.ps1' } catch { $false }
-  } | ForEach-Object { try { Stop-Process -Id $_.Id -Force -ErrorAction SilentlyContinue } catch {} }
   # Persistir variables a nivel de maquina para que la tarea las herede
   [Environment]::SetEnvironmentVariable('AGENT_TOKEN', $Token,    'Machine')
   [Environment]::SetEnvironmentVariable('INGEST_URL',  $Url,      'Machine')
   [Environment]::SetEnvironmentVariable('INTERVAL',    "$Interval",'Machine')
   [Environment]::SetEnvironmentVariable('MODE',        'run',     'Machine')
-  [Environment]::SetEnvironmentVariable('TORO_INSTALL_AT', (Get-Date).ToString('o'), 'Machine')
   # ONSTART task (SYSTEM) - se registra con XML para eliminar el limite por defecto
   # de 72h (ExecutionTimeLimit=PT0S) y activar reintentos automaticos si falla.
   $agentXml = @"
@@ -1806,7 +1884,6 @@ function Install-Agent {
 "@
   $agentXmlPath = Join-Path $InstallDir 'agent-task.xml'
   Set-Content -Encoding Unicode -Path $agentXmlPath -Value $agentXml
-
   & schtasks.exe /Create /TN $TaskName /XML $agentXmlPath /F | Out-Null
   if ($LASTEXITCODE -ne 0) { W-Fail 'no se pudo crear la tarea programada del sistema' }
 
@@ -1824,9 +1901,7 @@ function Install-Agent {
     ('sh.Run "powershell.exe -NoLogo -NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File ""' + $ScriptPath + '""", 0, False')
   )
   Set-Content -Encoding ASCII -Path $SessionsVbsPath -Value $vbsLines
-  if (Test-Path $LocationRequestPath) {
-    Remove-Item $LocationRequestPath -Force -ErrorAction SilentlyContinue
-  }
+  New-Item -ItemType File -Path $LocationRequestPath -Force | Out-Null
   $sessionsXml = @"
 <?xml version="1.0" encoding="UTF-16"?>
 <Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
@@ -1884,11 +1959,7 @@ function Install-Agent {
     'Set sh = CreateObject("WScript.Shell")',
     ('sh.Run "powershell.exe -NoLogo -NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File ""' + $ShutdownPsPath + '""", 0, True')
   )
-  if ($null -ne $ShutdownVbsPath) {
-    Set-Content -Encoding ASCII -Path $ShutdownVbsPath -Value $shutdownVbs
-  }
-  # Borrar archivos XML temporales tras el registro para limpieza
-  Remove-Item $agentXmlPath, $sessionsXmlPath, $shutdownXmlPath -Force -ErrorAction SilentlyContinue
+  Set-Content -Encoding ASCII -Path $ShutdownVbsPath -Value $shutdownVbs
   $shutdownXml = @"
 <?xml version="1.0" encoding="UTF-16"?>
 <Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
@@ -1929,20 +2000,8 @@ function Install-Agent {
   $shutdownXmlPath = Join-Path $InstallDir 'shutdown-task.xml'
   Set-Content -Encoding Unicode -Path $shutdownXmlPath -Value $shutdownXml
   & schtasks.exe /Create /TN $ShutdownTaskName /XML $shutdownXmlPath /F | Out-Null
-
   if ($LASTEXITCODE -ne 0) { W-Log 'aviso: no se pudo crear la tarea de apagado (offline instantaneo deshabilitado)' }
   W-Ok 'tareas creadas'
-
-  # Asegurar primer latido forzado para que aparezca "en linea" inmediatamente en la plataforma
-  try {
-    W-Log "Iniciando primer envio de metricas forzado..."
-    $metrics = Collect-Metrics
-    $res = Post-Json $Url $metrics
-    if ($res) { W-Ok 'Primer latido enviado y confirmado' }
-    else { W-Log 'aviso: primer latido no recibio respuesta (se intentara de nuevo en la tarea background)' }
-  } catch {
-    W-Log "aviso: error en primer latido forzado: $($_.Exception.Message)"
-  }
 
   W-Step 7 $total 'Iniciando agente en background...'
   & schtasks.exe /Run /TN $TaskName | Out-Null
