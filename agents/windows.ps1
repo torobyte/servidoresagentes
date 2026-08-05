@@ -14,7 +14,7 @@ $p=0;'Ssl3','Tls','Tls11','Tls12','Tls13'|%{try{$p=$p-bor[Net.SecurityProtocolTy
 try { [Net.ServicePointManager]::ServerCertificateValidationCallback = { $true } } catch {}
 $ErrorActionPreference = 'Continue'
 
-$AgentVersion = '2.3.2-windows-no-gps'
+$AgentVersion = '2.3.2-windows-rt'
 $Token        = if ($env:AGENT_TOKEN) { $env:AGENT_TOKEN } else { $env:TOKEN }
 $Url          = if ($env:INGEST_URL)  { $env:INGEST_URL }  else { $env:URL }
 $Interval     = if ($env:INTERVAL)    { [int]$env:INTERVAL } else { 5 }
@@ -1595,6 +1595,7 @@ function Run-AgentLoop {
   $programsUrl = Get-IngestEndpoint 'programs'
   $Script:_progLastAt = [DateTime]::MinValue
   $Script:_secLastAt = [DateTime]::MinValue
+  $Script:_secLastFingerprint = ""
   $secIntervalSec = 3600
 
   W-Log "torobyte-agent $AgentVersion started interval=$Interval endpoint=$Url"
@@ -1687,10 +1688,30 @@ function Run-AgentLoop {
       W-Log "loop error: $($_.Exception.Message)"
     }
     try {
-      if (((Get-Date) - $Script:_secLastAt).TotalSeconds -ge $secIntervalSec) {
+      $now = Get-Date
+      $secDue = ($now - $Script:_secLastAt).TotalSeconds -ge $secIntervalSec
+      if ($secDue -or ($env:ONCE -eq '1')) {
         $secPayload = Collect-Security
-        $secResp = Post-Json $securityUrl $secPayload
-        if ($secResp) { $Script:_secLastAt = Get-Date }
+        $fp = ""
+        try {
+          # Fingerprint ignoring transient details like dates or counts to detect real changes
+          $fpObj = @{
+            av = $secPayload.antivirus_enabled; avUp = $secPayload.antivirus_up_to_date;
+            fw = $secPayload.firewall_enabled; disk = $secPayload.disk_encryption;
+            uac = $secPayload.uac_enabled; lock = $secPayload.screen_lock;
+            pending = $secPayload.pending_updates; crit = $secPayload.critical_updates;
+            ports = $secPayload.open_ports_count
+          }
+          $fp = $fpObj | ConvertTo-Json -Compress
+        } catch {}
+
+        if ($secDue -or ($fp -ne $Script:_secLastFingerprint) -or ($env:ONCE -eq '1')) {
+          $secResp = Post-Json $securityUrl $secPayload
+          if ($secResp) { 
+            $Script:_secLastAt = $now
+            $Script:_secLastFingerprint = $fp
+          }
+        }
       }
     } catch { W-Log "security post error: $($_.Exception.Message)" }
     if ($env:ONCE -eq '1') { return $cycleOk }
