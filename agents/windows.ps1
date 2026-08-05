@@ -14,7 +14,7 @@ $p=0;'Ssl3','Tls','Tls11','Tls12','Tls13'|%{try{$p=$p-bor[Net.SecurityProtocolTy
 try { [Net.ServicePointManager]::ServerCertificateValidationCallback = { $true } } catch {}
 $ErrorActionPreference = 'Continue'
 
-$AgentVersion = '2.3.2-windows'
+$AgentVersion = '2.3.2-windows-no-gps'
 $Token        = if ($env:AGENT_TOKEN) { $env:AGENT_TOKEN } else { $env:TOKEN }
 $Url          = if ($env:INGEST_URL)  { $env:INGEST_URL }  else { $env:URL }
 $Interval     = if ($env:INTERVAL)    { [int]$env:INTERVAL } else { 5 }
@@ -30,9 +30,8 @@ $ShutdownTaskName = 'TorobyteAgentShutdown'
 $SessionsVbsPath  = Join-Path $InstallDir 'torobyte-sessions.vbs'
 $ShutdownPsPath   = Join-Path $InstallDir 'torobyte-shutdown.ps1'
 $ShutdownVbsPath  = Join-Path $InstallDir 'torobyte-shutdown.vbs'
-$LocationRequestPath = Join-Path $InstallDir 'location-requested.flag'
-$LocationFixPath     = Join-Path $InstallDir 'location-user-fix.json'
-$LocationConsentPath = Join-Path $InstallDir 'location-consent.json'
+# Rutas de flags de ubicacion eliminadas
+
 
 function W-Log($msg) {
   $line = "[$((Get-Date).ToString('o'))] $msg"
@@ -171,112 +170,17 @@ function Get-PrivIp {
 $Script:_pubIp     = ''
 $Script:_pubIpAt   = $null
 function Get-WifiAps {
-  # Redes Wi-Fi cercanas (BSSID + señal) para geolocalizar el equipo con
-  # precisión de calle. Se refresca cada 10 minutos. Silencioso: si el equipo
-  # no tiene Wi-Fi o el servicio WLAN está detenido devuelve una lista vacía.
-  if ($Script:_wifiAps -ne $null -and $Script:_wifiApsAt -and ((Get-Date) - $Script:_wifiApsAt).TotalMinutes -lt 10) {
-    return $Script:_wifiAps
-  }
-  $list = @()
-  try {
-    $svc = Get-Service -Name WlanSvc -ErrorAction SilentlyContinue
-    if ($svc -and $svc.Status -eq 'Running') {
-      $out = (& netsh.exe wlan show networks mode=bssid 2>$null | Out-String)
-      $mac = $null
-      foreach ($line in ($out -split "\`r?\`n")) {
-        if ($line -match '(?i)BSSID\s+\d+\s*:\s*([0-9a-fA-F]{2}(:[0-9a-fA-F]{2}){5})') {
-          $mac = $Matches[1].ToLower()
-        } elseif ($mac -and $line -match '(?i):\s*(\d{1,3})\s*%') {
-          $pct = [int]$Matches[1]
-          $rssi = [int](($pct / 2) - 100)
-          $list += [pscustomobject]@{ mac = $mac; rssi = $rssi }
-          $mac = $null
-        }
-      }
-      if ($list.Count -gt 24) { $list = $list[0..23] }
-    }
-  } catch { $list = @() }
-  $Script:_wifiAps = @($list)
-  $Script:_wifiApsAt = Get-Date
-  return $Script:_wifiAps
+  # Redes Wi-Fi cercanas (BSSID + señal) eliminadas por privacidad y solicitud del usuario.
+  return ,@()
 }
 
-$Script:_geoFix   = $null
-$Script:_geoFixAt = $null
-function Enable-LocationService {
-  # Habilita el servicio, pero nunca concede el permiso en nombre del usuario.
-  # Windows exige solicitar el consentimiento desde la sesion interactiva.
-  try {
-    $cfg = 'HKLM:\SYSTEM\CurrentControlSet\Services\lfsvc\Service\Configuration'
-    if (Test-Path $cfg) { New-ItemProperty -Path $cfg -Name 'Status' -Value 1 -PropertyType DWord -Force | Out-Null }
-    $svc = Get-Service -Name lfsvc -ErrorAction SilentlyContinue
-    if ($svc -and $svc.Status -ne 'Running') {
-      Set-Service -Name lfsvc -StartupType Automatic -ErrorAction SilentlyContinue
-      Start-Service -Name lfsvc -ErrorAction SilentlyContinue
-    }
-  } catch {}
-}
-
-function Get-UserGeoFix {
-  try {
-    if (-not (Test-Path $LocationFixPath)) { return $null }
-    $item = Get-Item $LocationFixPath -ErrorAction Stop
-    if (((Get-Date) - $item.LastWriteTime).TotalMinutes -gt 15) { return $null }
-    $saved = Get-Content $LocationFixPath -Raw -ErrorAction Stop | ConvertFrom-Json
-    if ($saved -and $saved.lat -ne $null -and $saved.lon -ne $null) { return $saved }
-  } catch {}
-  return $null
-}
-
-function Get-UserConsentPath {
-  try {
-    $root = if ($env:LOCALAPPDATA) { Join-Path $env:LOCALAPPDATA 'TorobyteAgent' } else { Join-Path $env:TEMP 'TorobyteAgent' }
-    New-Item -ItemType Directory -Force -Path $root | Out-Null
-    return (Join-Path $root 'location-consent.json')
-  } catch { return $null }
-}
-
-function Set-GpsConsent {
-  param([string]$State, [string]$Reason)
-  $json = @{ state = $State; reason = $Reason; at = (Get-Date).ToString('o') } | ConvertTo-Json -Compress
-  # La tarea de sesion corre sin privilegios: escribimos en ProgramData y en el
-  # perfil del usuario para que el servicio SYSTEM siempre encuentre la respuesta.
-  try { Set-Content -Encoding UTF8 -Path $LocationConsentPath -Value $json -ErrorAction Stop } catch {}
-  $up = Get-UserConsentPath
-  if ($up) { try { Set-Content -Encoding UTF8 -Path $up -Value $json -ErrorAction Stop } catch {} }
-}
-
-function Get-GpsConsent {
-  $best = $null; $bestAt = $null
-  foreach ($p in @($LocationConsentPath, (Get-UserConsentPath))) {
-    if (-not $p) { continue }
-    try {
-      if (-not (Test-Path $p)) { continue }
-      $c = Get-Content $p -Raw -ErrorAction Stop | ConvertFrom-Json
-      if (-not $c) { continue }
-      $at = $null
-      try { $at = [datetime]::Parse("$($c.at)") } catch { $at = (Get-Item $p).LastWriteTime }
-      if (-not $bestAt -or $at -gt $bestAt) { $best = $c; $bestAt = $at }
-    } catch {}
-  }
-  return $best
-}
-
-function Grant-LocationCapability {
-  # Solo SYSTEM/administrador: habilita la capacidad de ubicacion del equipo
-  # una vez que el usuario ya autorizo explicitamente en el cuadro del agente.
-  try {
-    Enable-LocationService
-    $stores = @(
-      'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore\location',
-      'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore\location\NonPackaged'
-    )
-    foreach ($s in $stores) {
-      if (-not (Test-Path $s)) { New-Item -Path $s -Force | Out-Null }
-      New-ItemProperty -Path $s -Name 'Value' -Value 'Allow' -PropertyType String -Force | Out-Null
-    }
-  } catch {}
-}
+# Funciones de geolocalizacion y consentimiento eliminadas por solicitud del usuario.
+function Enable-LocationService { return }
+function Get-UserGeoFix { return $null }
+function Get-UserConsentPath { return $null }
+function Set-GpsConsent { return }
+function Get-GpsConsent { return $null }
+function Grant-LocationCapability { return }
 
 function Show-LocationConsentDialog {
   # Eliminado por solicitud del usuario: no se solicita ubicacion.
@@ -500,11 +404,8 @@ function Collect-Metrics {
     if ($bios -and $bios.SerialNumber) { $serialNumber = ($bios.SerialNumber -replace '\s+', ' ').Trim() }
   } catch {}
 
-  $geoFix = Get-UserGeoFix
-  if (-not $geoFix) { $geoFix = Get-NativeGeo }
-  $gpsConsent = Get-GpsConsent
-  if ($gpsConsent -and "$($gpsConsent.state)" -eq 'granted') { Grant-LocationCapability }
-
+  
+  # Geolocalizacion desactivada por el usuario.
   [pscustomobject]@{
     hostname      = $env:COMPUTERNAME
     os            = $os.Caption
@@ -515,13 +416,9 @@ function Collect-Metrics {
     total_ram     = "$totGB GB"
     total_disk    = $totalDiskStr
     public_ip     = (Get-PubIp)
-    wifi_aps      = @(Get-WifiAps)
-    latitude      = $(if ($geoFix) { $geoFix.lat } else { $null })
-    longitude     = $(if ($geoFix) { $geoFix.lon } else { $null })
-    location_accuracy_m = $(if ($geoFix) { $geoFix.acc } else { $null })
-    location_source     = $(if ($geoFix) { $geoFix.src } else { $null })
-    gps_consent         = $(if ($gpsConsent -and $gpsConsent.state) { "$($gpsConsent.state)" } else { 'pending' })
-    gps_consent_reason  = $(if ($gpsConsent -and $gpsConsent.reason) { "$($gpsConsent.reason)" } else { 'Autorizacion de ubicacion aun no solicitada al usuario' })
+    wifi_aps      = @()
+    # latitude / longitude / gps_consent removidos
+
 
 
 
@@ -1729,12 +1626,8 @@ function Run-AgentLoop {
             $Script:_secLastAt = [DateTime]::MinValue
           }
         } catch {}
-        try {
-          if ($resp.location_now -eq $true -or $resp.request_gps_consent -eq $true) {
-            New-Item -ItemType File -Path $LocationRequestPath -Force | Out-Null
-            W-Log 'solicitud de autorizacion GPS pendiente para el usuario'
-          }
-        } catch {}
+        # Solicitudes de GPS desactivadas por el usuario.
+
       } else {
         W-Log 'metrics failed'
       }
