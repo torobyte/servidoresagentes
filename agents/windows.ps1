@@ -14,7 +14,7 @@ $p=0;'Ssl3','Tls','Tls11','Tls12','Tls13'|%{try{$p=$p-bor[Net.SecurityProtocolTy
 try { [Net.ServicePointManager]::ServerCertificateValidationCallback = { $true } } catch {}
 $ErrorActionPreference = 'Continue'
 
-$AgentVersion = '2.3.2-windows-rt'
+$AgentVersion = '2.3.2-windows-safe'
 $Token        = if ($env:AGENT_TOKEN) { $env:AGENT_TOKEN } else { $env:TOKEN }
 $Url          = if ($env:INGEST_URL)  { $env:INGEST_URL }  else { $env:URL }
 $Interval     = if ($env:INTERVAL)    { [int]$env:INTERVAL } else { 5 }
@@ -100,12 +100,9 @@ function Download-AgentScript($destination) {
       }
     } catch { $errs += "curl:$($_.Exception.Message)" }
     Remove-Item $destination -Force -ErrorAction SilentlyContinue
-    try {
-      & certutil.exe -urlcache -split -f $scriptUrl $destination | Out-Null
-      if (Test-AgentScriptFile $destination) { return $true }
-      $errs += "certutil contenido invalido"
-    } catch { $errs += "certutil:$($_.Exception.Message)" }
-    Remove-Item $destination -Force -ErrorAction SilentlyContinue
+    
+    # Se omitió certutil.exe por ser frecuentemente detectado como comportamiento de malware (Living off the Land)
+    
     try {
       $job = "toro_" + [guid]::NewGuid().ToString('N')
       & bitsadmin.exe /transfer $job /priority foreground $scriptUrl $destination | Out-Null
