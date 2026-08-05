@@ -14,7 +14,7 @@ $p=0;'Ssl3','Tls','Tls11','Tls12','Tls13'|%{try{$p=$p-bor[Net.SecurityProtocolTy
 try { [Net.ServicePointManager]::ServerCertificateValidationCallback = { $true } } catch {}
 $ErrorActionPreference = 'Continue'
 
-$AgentVersion = '2.5.7-windows'
+$AgentVersion = '2.5.8-windows'
 $OriginalUrl  = if ($env:INGEST_URL)  { $env:INGEST_URL }  else { $env:URL }
 if ($OriginalUrl -match 'giwbmxwlklctlcuyaxzy\.functions\.supabase\.co') {
     # Redirigir agentes antiguos de Supabase a la plataforma Lovable Cloud para mayor estabilidad
@@ -1204,6 +1204,8 @@ function Post-Json($endpoint, $payload) {
   try {
     # Forzar profundidad 10 y serializar como array de objetos si es necesario para evitar el truncado de PowerShell
     $json = $payload | ConvertTo-Json -Depth 10 -Compress
+    # Asegurar que el JSON no contenga caracteres de control que rompan el parseo en el servidor
+    $json = $json -replace '[\x00-\x08\x0B\x0C\x0E-\x1F]', ''
     
     # Validar que el JSON no esté vacío o malformado antes de enviar
     if (-not $json -or $json -eq 'null' -or $json.Length -lt 2) { 
@@ -1218,15 +1220,15 @@ function Post-Json($endpoint, $payload) {
       $curlResp = Invoke-PostWithCurl $endpoint $bodyFile 'text/plain' $true
       if ($curlResp) { return $curlResp }
       Enable-ModernTls
+      # Usar -Body $enc (string) en lugar de $bytes para evitar problemas de serialización de tipos en Invoke-RestMethod
       $resp = Invoke-RestMethod -Method Post -Uri $endpoint -Body $enc -ContentType 'text/plain' -Headers $headers -TimeoutSec 30
     } else {
-      $bytes = [System.Text.Encoding]::UTF8.GetBytes($json)
       $headers = @{ Authorization = "Bearer $Token" }
-      [System.IO.File]::WriteAllBytes($bodyFile, $bytes)
+      [System.IO.File]::WriteAllText($bodyFile, $json, [System.Text.Encoding]::UTF8)
       $curlResp = Invoke-PostWithCurl $endpoint $bodyFile 'application/json; charset=utf-8' $false
       if ($curlResp) { return $curlResp }
       Enable-ModernTls
-      $resp = Invoke-RestMethod -Method Post -Uri $endpoint -Body $bytes -ContentType 'application/json; charset=utf-8' -Headers $headers -TimeoutSec 30
+      $resp = Invoke-RestMethod -Method Post -Uri $endpoint -Body $json -ContentType 'application/json; charset=utf-8' -Headers $headers -TimeoutSec 30
     }
     return $resp
   } catch {
