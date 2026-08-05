@@ -1244,24 +1244,24 @@ function Collect-Security {
   # -1 = desconocido. Nunca se reporta 0 si no se pudo consultar.
   $script:pending = -1; $script:critical = -1; $script:lastUpd = $null; $script:updSource = $null
   Try-Get {
-    $Session = New-Object -ComObject Microsoft.Update.Session
+    $Session = New-Object -ComObject Microsoft.Update.Session -ErrorAction Stop
     $Searcher = $Session.CreateUpdateSearcher()
     $Searcher.Online = $true
     $r = $Searcher.Search("IsInstalled=0 and Type='Software' and IsHidden=0")
     $script:pending = [int]$r.Updates.Count
     $script:critical = @($r.Updates | Where-Object { $_.MsrcSeverity -eq "Critical" -or $_.MsrcSeverity -eq "Important" }).Count
     $script:updSource = "com-online"
-  } 'updates-com-online' | Out-Null
+  } $null | Out-Null
   if ($pending -lt 0) {
     Try-Get {
-      $Session = New-Object -ComObject Microsoft.Update.Session
+      $Session = New-Object -ComObject Microsoft.Update.Session -ErrorAction Stop
       $Searcher = $Session.CreateUpdateSearcher()
       $Searcher.Online = $false
       $r = $Searcher.Search("IsInstalled=0 and Type='Software' and IsHidden=0")
       $script:pending = [int]$r.Updates.Count
       $script:critical = @($r.Updates | Where-Object { $_.MsrcSeverity -eq "Critical" -or $_.MsrcSeverity -eq "Important" }).Count
       $script:updSource = "com-cache"
-    } 'updates-com-cache' | Out-Null
+    } $null | Out-Null
   }
   if ($pending -lt 0) {
     Try-Get {
@@ -1312,7 +1312,7 @@ function Collect-Security {
       if ($mp.AntivirusSignatureAge -ne $null) { $script:avUpToDate = ([int]$mp.AntivirusSignatureAge -le 7) }
       $script:defScan = $mp.QuickScanEndTime
     }
-  } 'antivirus-defender' | Out-Null
+  } $null | Out-Null
   Try-Get {
     $prods = @(Get-CimInstance -Namespace root/SecurityCenter2 -ClassName AntiVirusProduct -ErrorAction Stop)
     if ($prods.Count -gt 0) {
@@ -1332,7 +1332,7 @@ function Collect-Security {
       if ($script:avEnabled -ne $true) { $script:avEnabled = $anyOn }
       if ($script:avUpToDate -eq $null) { $script:avUpToDate = $anyUpToDate }
     }
-  } 'antivirus-securitycenter' | Out-Null
+  } $null | Out-Null
   # Fallback: servicio de Defender en ejecución (Server Core sin SecurityCenter2)
   if ($script:avEnabled -eq $null) {
     Try-Get {
@@ -1380,7 +1380,7 @@ function Collect-Security {
     $vol = Get-BitLockerVolume -MountPoint "C:" -ErrorAction Stop
     $script:diskEnc = ($vol.ProtectionStatus -eq "On" -or [int]$vol.ProtectionStatus -eq 1)
     if ($script:diskEnc) { $script:diskEncMethod = "BitLocker $($vol.EncryptionMethod)" }
-  } 'bitlocker-cmdlet' | Out-Null
+  } $null | Out-Null
   if ($script:diskEnc -eq $null) {
     Try-Get {
       $out = & manage-bde -status C: 2>$null
@@ -1389,7 +1389,7 @@ function Collect-Security {
         if ($txt -match '(?i)Protection\s+On|Protecci.n\s+activada') { $script:diskEnc = $true }
         elseif ($txt -match '(?i)Protection\s+Off|Protecci.n\s+desactivada') { $script:diskEnc = $false }
       }
-    } 'bitlocker-managebde' | Out-Null
+    } $null | Out-Null
   }
 
   $script:uac = $null
@@ -1794,7 +1794,7 @@ function Install-Agent {
     ('sh.Run "powershell.exe -NoLogo -NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File ""' + $ScriptPath + '""", 0, False')
   )
   Set-Content -Encoding ASCII -Path $SessionsVbsPath -Value $vbsLines
-  New-Item -ItemType File -Path $LocationRequestPath -Force | Out-Null
+  W-Ok 'tareas creadas'
   $sessionsXml = @"
 <?xml version="1.0" encoding="UTF-16"?>
 <Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
@@ -1894,7 +1894,7 @@ function Install-Agent {
   Set-Content -Encoding Unicode -Path $shutdownXmlPath -Value $shutdownXml
   & schtasks.exe /Create /TN $ShutdownTaskName /XML $shutdownXmlPath /F | Out-Null
   if ($LASTEXITCODE -ne 0) { W-Log 'aviso: no se pudo crear la tarea de apagado (offline instantaneo deshabilitado)' }
-  W-Ok 'tareas creadas'
+
 
   W-Step 7 $total 'Iniciando agente en background...'
   & schtasks.exe /Run /TN $TaskName | Out-Null
