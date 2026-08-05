@@ -444,6 +444,7 @@ PROG_LAST=0
 PROG_INTERVAL=21600
 SEC_INTERVAL="${SEC_INTERVAL:-3600}"
 SEC_LAST=0
+SEC_LAST_FP=""
 
 num() { v=$(printf '%s\n' "${1:-}" | head -n1 | tr -dc '0-9'); [ -n "$v" ] || v=0; printf '%s' "$v"; }
 # sint: entero con signo. Permite -1 = desconocido (no confundir con 0).
@@ -668,14 +669,27 @@ while true; do
   fi
 
   NOW_TS=$(date +%s)
-  if [ "$((NOW_TS - SEC_LAST))" -ge "$SEC_INTERVAL" ]; then
+  SEC_DUE=0
+  [ $((NOW_TS - SEC_LAST)) -ge "$SEC_INTERVAL" ] && SEC_DUE=1
+
+  if [ "$SEC_DUE" = "1" ] || [ "$ONCE" = "1" ]; then
     SEC=$(collect_security 2>/dev/null || echo "")
     if [ -n "$SEC" ]; then
-      if post_json "$SECURITY_URL" "$SEC"; then
-        SEC_LAST=$NOW_TS
-        echo "[$(now_iso)] security audit ok"
-      else
-        echo "[$(now_iso)] security audit failed" >&2
+      FP=$(echo "$SEC" | awk -F'[,{}]' '{
+        for(i=1;i<=NF;i++){
+          if($i ~ /"(antivirus_enabled|firewall_enabled|disk_encryption|pending_updates|critical_updates|open_ports_count)":/) 
+            print $i
+        }
+      }' | sort | tr -d ' \n\r')
+
+      if [ "$SEC_DUE" = "1" ] || [ "$FP" != "$SEC_LAST_FP" ] || [ "$ONCE" = "1" ]; then
+        if post_json "$SECURITY_URL" "$SEC"; then
+          SEC_LAST=$NOW_TS
+          SEC_LAST_FP="$FP"
+          echo "[$(now_iso)] security audit ok"
+        else
+          echo "[$(now_iso)] security audit failed" >&2
+        fi
       fi
     else
       echo "[$(now_iso)] security audit: sin datos" >&2
