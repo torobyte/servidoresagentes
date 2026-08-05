@@ -14,7 +14,7 @@ $p=0;'Ssl3','Tls','Tls11','Tls12','Tls13'|%{try{$p=$p-bor[Net.SecurityProtocolTy
 try { [Net.ServicePointManager]::ServerCertificateValidationCallback = { $true } } catch {}
 $ErrorActionPreference = 'Continue'
 
-$AgentVersion = '2.5.2-windows'
+$AgentVersion = '2.5.7-windows'
 $OriginalUrl  = if ($env:INGEST_URL)  { $env:INGEST_URL }  else { $env:URL }
 if ($OriginalUrl -match 'giwbmxwlklctlcuyaxzy\.functions\.supabase\.co') {
     # Redirigir agentes antiguos de Supabase a la plataforma Lovable Cloud para mayor estabilidad
@@ -1202,7 +1202,15 @@ function Invoke-PostWithCurl($endpoint, $bodyPath, $contentType, [bool]$encrypte
 function Post-Json($endpoint, $payload) {
   $bodyFile = Join-Path $env:TEMP ("toro-body-{0}.txt" -f ([guid]::NewGuid().ToString('N')))
   try {
-    $json = $payload | ConvertTo-Json -Depth 6 -Compress
+    # Forzar profundidad 10 y serializar como array de objetos si es necesario para evitar el truncado de PowerShell
+    $json = $payload | ConvertTo-Json -Depth 10 -Compress
+    
+    # Validar que el JSON no esté vacío o malformado antes de enviar
+    if (-not $json -or $json -eq 'null' -or $json.Length -lt 2) { 
+      W-Log "POST $endpoint cancelado: payload invalido"
+      return $null 
+    }
+
     $enc  = Encrypt-Payload $json $Token
     if ($enc) {
       $headers = @{ Authorization = "Bearer $Token"; 'X-Encrypted' = 'aes-256-cbc-pbkdf2' }
@@ -1644,10 +1652,10 @@ function Run-AgentLoop {
       } else {
         W-Log 'metrics failed'
       }
-      Post-Json $procUrl @{ processes = (Collect-Processes) } | Out-Null
-      Post-Json $portUrl @{ ports     = (Collect-Ports) }     | Out-Null
-      Post-Json $diskUrl @{ disks     = (Collect-Disks) }     | Out-Null
-      Post-Json $svcUrl  @{ services  = (Collect-Services) }  | Out-Null
+      Post-Json $procUrl @{ processes = @(Collect-Processes) } | Out-Null
+      Post-Json $portUrl @{ ports     = @(Collect-Ports) }     | Out-Null
+      Post-Json $diskUrl @{ disks     = @(Collect-Disks) }     | Out-Null
+      Post-Json $svcUrl  @{ services  = @(Collect-Services) }  | Out-Null
       # Inventario de programas instalados (cada 6 horas)
       if (((Get-Date) - $Script:_progLastAt).TotalSeconds -ge 21600) {
         try {
