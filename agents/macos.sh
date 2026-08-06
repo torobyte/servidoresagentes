@@ -170,6 +170,11 @@ if [ "$MODE" = "uninstall" ] || [ "$MODE" = "remove" ]; then
 fi
 
 # -------------------------- Runtime (collect/post) --------------------------
+LOCATION_CONSENT_MARKER="/tmp/.torobyte-gps-consent"
+request_location_consent() { :; }
+wifi_aps_json() { printf '[]'; }
+gps_coords_json() { printf 'null'; }
+gps_consent_state() { printf 'denied|unsupported'; }
 
 RESP_FILE="${TMPDIR:-/tmp}/torobyte-agent.$$.resp"
 case "$INTERVAL" in ''|*[!0-9]*) INTERVAL=5 ;; esac
