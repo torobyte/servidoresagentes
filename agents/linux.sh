@@ -121,6 +121,7 @@ if [ "$MODE" = "uninstall" ] || [ "$MODE" = "remove" ]; then
   printf "   Recuerda eliminar el servidor también desde la plataforma si ya no lo necesitas.\n\n"
   exit 0
 fi
+wifi_aps_json() { printf '[]'; }
 RESP_FILE="${TMPDIR:-/tmp}/torobyte-agent.$$.resp"
 
 case "$INTERVAL" in ''|*[!0-9]*) INTERVAL=5 ;; esac
