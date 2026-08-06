@@ -1564,9 +1564,14 @@ function Check-SelfUpdate($resp) {
   $updateTo = $null
   try { $updateTo = $resp.update_to } catch {}
   if (-not $updateTo) { return }
-  $base = ($AgentVersion -split '-')[0]
-  if ($updateTo -eq $base) { return }
-  W-Log "update_to=$updateTo solicitada - reinstalando agente"
+  
+  # Si la version solicitada es exactamente la actual, no hacer nada
+  if ($updateTo -eq $AgentVersion) { return }
+  
+  # Si la version solicitada es v2.3.2 y tenemos una v2.3.6+, considerar si es un rollback
+  # pero por ahora permitimos cualquier cambio que no sea a la version actual.
+  
+  W-Log "update_to=$updateTo solicitada - reinstalando agente (actual=$AgentVersion)"
   try {
     $newScript = Join-Path $env:TEMP ("torobyte-agent.new.{0}.ps1" -f $PID)
     if (-not (Download-AgentScript $newScript)) { throw 'no se pudo descargar update' }
